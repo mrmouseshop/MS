@@ -407,6 +407,20 @@ function findProductMeta(pRaw, weight) {
       const nameAgeMatch = nameLower.match(ageRegex);
       if (queryAgeMatch && nameAgeMatch && queryAgeMatch[1] !== nameAgeMatch[1]) continue;
 
+      // Некоторые товары существуют в каталоге как ДВЕ (или больше) отдельные карточки
+      // разной заводской фасовки с весом прямо в названии — например "Пекорино Романо
+      // Sepi ~300гр" и "Пекорино Романо Sepi ~900гр" — это разные товары, а не один
+      // весовой сыр с примерным весом. Без этой проверки нечёткий поиск (порог 67% для
+      // не-хамона) мог посчитать 3 из 4 слов совпавшими и вернуть ПЕРВУЮ карточку по
+      // порядку в кэше, даже если вес в её названии не совпадает с весом в запросе —
+      // например, отчёт "...Sepi ~900гр" тихо подставлялся как карточка "~300гр".
+      // Как и с "мес"/"mesi" выше: если и в запросе, и в названии-кандидате явно указан
+      // вес в граммах, числа обязаны совпасть.
+      const gramRegex = /(\d+)\s*гр(?![а-яёА-ЯЁa-zA-Z])/;
+      const queryGramMatch = query.match(gramRegex);
+      const nameGramMatch = nameLower.match(gramRegex);
+      if (queryGramMatch && nameGramMatch && queryGramMatch[1] !== nameGramMatch[1]) continue;
+
       return { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price };
     }
   }
