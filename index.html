@@ -1027,6 +1027,13 @@ async function processReport(reportTextRaw) {
 
       const bracketMatch = content.match(/\(([ \d.+]+)\)/);
       let weight;
+      // Ещё один формат: "N шт => (X * Y₽/100гр) = Z ₽" — например
+      // "1 шт => (1.24 * 390₽/100гр) = 4836 ₽". Тут "N шт" — просто пометка "штучный товар
+      // продан", а РЕАЛЬНЫЙ отгружаемый вес (в кг, раз цена весовая, за 100г) — число ВНУТРИ
+      // скобок перед "*". Без этой проверки код брал "N" из "N шт" как вес (то есть "1" или
+      // "2" вместо настоящих 1.24/2.312 кг) — отгружалось МЕНЬШЕ товара, чем было продано.
+      // Проверяем ЭТО раньше "N шт", потому что здесь "шт" — не про количество отгрузки.
+      const weightRateMatch = content.match(/\(\s*(\d+(?:[.,]\d+)?)\s*\*\s*\d+(?:[.,]\d+)?\s*(?:₽|руб)?\s*\/\s*100\s*г/i);
       // Новый формат иногда пишет количество штук явно словом "шт" — например
       // "2 шт × 950₽ = 1900 ₽". Это проверяем ПЕРВЫМ (после веса-в-скобках), так как это
       // однозначный сигнал количества, а не цены — в отличие от старого формата
@@ -1035,7 +1042,9 @@ async function processReport(reportTextRaw) {
       // ВАЖНО: \b не работает после кириллицы (кириллица — не \w в JS), поэтому границу
       // после "шт" проверяем вручную через negative lookahead на буквы, а не через \b.
       const mSht = content.match(/(\d+(?:[.,]\d+)?)\s*шт(?![а-яёА-ЯЁa-zA-Z])/i);
-      if (bracketMatch && /\d+\.\d+/.test(bracketMatch[1])) {
+      if (weightRateMatch) {
+        weight = parseFloat(weightRateMatch[1].replace(',', '.'));
+      } else if (bracketMatch && /\d+\.\d+/.test(bracketMatch[1])) {
         const weights = bracketMatch[1].match(/\d+\.\d+/g) || [];
         weight = weights.length ? pyRound(weights.reduce((s, w) => s + parseFloat(w), 0), 3) : 1.0;
       } else if (mSht) {
