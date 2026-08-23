@@ -719,11 +719,19 @@ function extractReportTotalKopecks(blockText) {
     if (dNums && dNums.length) deliveryRub = parseFloat(dNums[dNums.length - 1].replace(',', '.'));
   }
 
+  // "Мусорные" суммы (не товар, вычитаются из Итого): аккумулятор холода/термопакет
+  // (обычно "= 100₽" ИЛИ просто "— 100₽" без знака "=") и комиссия магазина за
+  // отправку/доставку (не содержит слова "доставка", поэтому не ловится dLineMatch
+  // выше, например "Комиссия магазина на отправку заказа суммой <5000₽ тк СДЭК: 250₽").
+  // Берём ПОСЛЕДНЕЕ число в строке (после удаления скобок) — как и для "доставки" —
+  // чтобы не спутать с числами вроде "<5000₽" внутри условия комиссии.
   let junkRub = 0.0;
-  const junkRegex = /(?:аккумулятор|термопакет)[^\n=]*=\s*(\d+(?:[.,]\d+)?)/gi;
+  const junkLineRegex = new RegExp(NOT_LETTER_BEFORE + '(?:аккумулятор|термопакет|комиссия)[а-яё]*[^\\n]*', 'gi');
   let jm;
-  while ((jm = junkRegex.exec(blockText)) !== null) {
-    junkRub += parseFloat(jm[1].replace(',', '.'));
+  while ((jm = junkLineRegex.exec(blockText)) !== null) {
+    const jLine = jm[0].replace(/\([^)]*\)/g, ' ');
+    const jNums = jLine.match(/\d+(?:[.,]\d+)?/g);
+    if (jNums && jNums.length) junkRub += parseFloat(jNums[jNums.length - 1].replace(',', '.'));
   }
 
   const goodsRub = itogoRub - deliveryRub - junkRub;
