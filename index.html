@@ -315,8 +315,28 @@ const MANUAL_MAP = {
   'набор хамон (палета) серрано espana la barrica': 'Набор Хамон (Палета) Серрано ESPANA la Barrica',
 };
 
+// Часть названий в каталоге (скопированных откуда-то с подменой раскладки) на самом деле
+// набрана "смешанным" шрифтом — визуально латинские буквы на деле кириллические омоглифы,
+// например "Rоdriguеz" (тут "о" и "е" — кириллица, выглядит как "Rodriguez", но байтово
+// другая строка). Если в отчёте товар набран НОРМАЛЬНОЙ латиницей, посимвольное сравнение
+// не совпадает, и товар не находится, хотя реально есть в каталоге. Сворачиваем такие
+// омоглифы в латиницу — И у запроса, И у названия из каталога — так сравнение остаётся
+// работать одинаково независимо от того, какой из вариантов набора попался.
+const HOMOGLYPH_MAP = { 'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x' };
+function foldHomoglyphs(s) {
+  return s.replace(/[аеорсух]/g, ch => HOMOGLYPH_MAP[ch]);
+}
+
 function findProductMeta(pRaw, weight) {
   let query = pRaw.toLowerCase().trim();
+
+  // Пометку "[SALE]" убираем ещё ДО разбиения на слова для поиска — иначе она сама
+  // становится обязательным словом запроса ("sale" длиннее 2 символов и попадает в
+  // queryWords), а для товаров "хамон" порог совпадения строгий — 100% слов запроса
+  // должны найтись в названии каталога. Каталожное название "sale" не содержит, и товар,
+  // который иначе совпал бы идеально, тихо не находился вовсе (см. "Хамон Серрано набор
+  // подарочный NICO 950гр [SALE]" — реальный товар в базе есть, но не находился).
+  query = query.replace(/\[\s*sale\s*\]/gi, '').trim();
 
   if (query.includes('фуагра') && query.includes('150')) {
     query = 'фуагра ассорти 150гр';
@@ -344,11 +364,13 @@ function findProductMeta(pRaw, weight) {
   }
 
   const queryWords = query.split(/[^а-яa-z0-9]/).filter(w => w.length >= 3);
+  const queryWordsFolded = queryWords.map(foldHomoglyphs);
 
   for (const fullName in PRODUCTS_CACHE) {
     const data = PRODUCTS_CACHE[fullName];
     const nameLower = fullName.toLowerCase();
-    const matches = queryWords.filter(w => nameLower.includes(w)).length;
+    const nameLowerFolded = foldHomoglyphs(nameLower);
+    const matches = queryWordsFolded.filter(w => nameLowerFolded.includes(w)).length;
     const isHamon = query.includes('хамон');
     const threshold = isHamon ? 1.0 : 0.67;
 
@@ -373,8 +395,16 @@ function findProductMeta(pRaw, weight) {
       // "(18 мес)" — и без этой проверки нечёткий поиск легко подставляет случайный из
       // них (например "(18 мес)" из отчёта отгружался как "(3 мес)" из каталога). Если и
       // в запросе, и в кандидате явно указано "N мес" — числа обязаны совпасть.
-      const queryAgeMatch = query.match(/(\d+)\s*мес/);
-      const nameAgeMatch = nameLower.match(/(\d+)\s*мес/);
+      // ВАЖНО: линейка Cantarelli в каталоге называется через ЛАТИНСКОЕ "mesi" (36mesi,
+      // 48mesi, 60mesi, 70mesi), а в отчёте менеджеры часто пишут срок кириллицей ("30мес",
+      // "40мес"). Без учёта латинского варианта регэксп видел возраст только у запроса, а у
+      // названия из каталога — нет ("mesi" не совпадает с "мес"), проверка молча
+      // пропускалась, и, например, "Пармезан 30мес Cantarelli" (которого вообще нет в
+      // каталоге под таким сроком) тихо подставлялся как "48mesi" — на 600₽ дороже. Теперь
+      // "мес"/"месяц" и "mesi" распознаются одинаково с обеих сторон.
+      const ageRegex = /(\d+)\s*(?:мес\w*|mesi)/i;
+      const queryAgeMatch = query.match(ageRegex);
+      const nameAgeMatch = nameLower.match(ageRegex);
       if (queryAgeMatch && nameAgeMatch && queryAgeMatch[1] !== nameAgeMatch[1]) continue;
 
       return { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price };
@@ -777,8 +807,14 @@ function unglueFusedItemMarkers(text) {
   //    его на "1" + "0. ОПЛАЧЕН");
   //  - сразу после маркера — БУКВА (название товара), а не ещё одна цифра —
   //    это отсекает даты вида "13.08" и дробные веса вида "4.5кг", где после
-  //    точки идут цифры, а не название товара.
-  return text.replace(/(?<![\n\d])(\d+[)\.]\s*(?=[А-ЯЁа-яёA-Za-z]))/g, '\n$1');
+  //    точки идут цифры, а не название товара;
+  //  - и до конца ЭТОЙ ЖЕ строки (до настоящего переноса) есть признак цены
+  //    (₽/руб или "* число") — иначе регэксп ложно "распиливает" обычный текст
+  //    адреса/времени в духе "...домофон 20. Время: 22 августа с 14 до 18." —
+  //    там после "20." тоже цифра+точка+заглавная буква, но это НЕ начало
+  //    позиции товара, а обычное предложение, и без этой проверки кусок текста
+  //    "Время: 22 августа..." ошибочно улетает в парсер как несуществующий товар.
+  return text.replace(/(?<![\n\d])(\d+[)\.]\s*(?=[А-ЯЁа-яёA-Za-z][^\n]*?(?:₽|руб\b|\*\s*\d)))/g, '\n$1');
 }
 
 /* ===================== ЗАКАЗЫ МАРКЕТПЛЕЙСОВ (ОЗОН И Т.П.) ===================== */
@@ -801,19 +837,27 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
 
 async function processMarketplaceOrder(header, block, lines, reportDate) {
   const cpRaw = lines[0] || 'OZON';
+  const fullDesc = `${header}\n${block.trim()}`;
 
-  let ozonQty = null;
-  let ozonArticle = null;
+  // Статус "Отменен" — заказ ОЗОН отменён маркетплейсом. Ничего со склада списывать и
+  // платёж проводить НЕ нужно (товар не уехал, денег не было), но контрагента (номер
+  // заказа) и "пустой" документ-заметку с комментарием всё равно заводим — чтобы был след
+  // в МоемСкладе и повторный прогон отчёта не пытался обработать этот заказ снова.
+  const isCancelled = lines.some(l => /отмен[её]н/i.test(l));
+
+  // Иногда в ОДНОМ заказе ОЗОН склеено НЕСКОЛЬКО разных товаров — каждая пара
+  // "N шт, артикул" на своей строке — а не только одна позиция. Раньше бралась только
+  // ПЕРВАЯ такая строка (break сразу после неё), и вторая/третья позиция тихо терялась —
+  // товар со склада не списывался вообще. Теперь собираем ВСЕ такие строки.
+  const ozonLines = [];
   for (const line of lines) {
     const m = line.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*(.+)$/i);
     if (m) {
-      ozonQty = parseFloat(m[1].replace(',', '.'));
-      ozonArticle = m[2].trim();
-      break;
+      ozonLines.push({ qty: parseFloat(m[1].replace(',', '.')), article: m[2].trim() });
     }
   }
 
-  if (!ozonArticle) {
+  if (!ozonLines.length && !isCancelled) {
     log(`  [!!!] ОЗОН: в заказе [${header}] не нашлась строка "N шт, артикул" — пропускаю, проведите вручную.`);
     return;
   }
@@ -829,21 +873,6 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     }
   }
 
-  const productData = findProductByArticle(ozonArticle);
-  if (!productData) {
-    log(`  [!!!] ВНИМАНИЕ: ОЗОН-товар с артикулом '${ozonArticle}' не найден в МоемСкладе! Заказ [${header}] — проведите вручную.`);
-    return;
-  }
-
-  const qtyMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[ozonArticle.toLowerCase()] || 1;
-  const shipQty = ozonQty * qtyMultiplier;
-  if (qtyMultiplier !== 1) {
-    log(`  [OZON] Артикул '${ozonArticle}' — это набор x${qtyMultiplier}: в отгрузку идёт ${shipQty} шт (${ozonQty} шт заказа ОЗОН × ${qtyMultiplier}).`);
-  }
-  log(`  [OZON] Артикул '${ozonArticle}' найден как '${productData.name}' (Кол-во: ${shipQty})`);
-
-  const newItem = { quantity: shipQty, assortment: { meta: productData.meta }, price: productData.price, _name: productData.name };
-  const fullDesc = `${header}\n${block.trim()}`;
   const cId = await getOrCreateCounterparty(cpRaw, '');
   if (!cId) return;
 
@@ -852,7 +881,38 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     return;
   }
 
-  const demandResult = await createDemand(cId, [newItem], reportDate, fullDesc);
+  if (isCancelled) {
+    const demandResult = await createDemand(cId, [], reportDate, fullDesc);
+    if (!demandResult) {
+      log(`  [ОШИБКА API] МойСклад не смог создать документ для отменённого заказа ОЗОН [${header}].`);
+      return;
+    }
+    log(`  [ОЗОН ОТМЕНЁН] Заказ [${header}] (${cpRaw}) отменён — создан пустой документ (контрагент + комментарий), без товаров и платежа.${drSuffix()}`);
+    return;
+  }
+
+  const newItems = [];
+  for (const { qty, article } of ozonLines) {
+    const productData = findProductByArticle(article);
+    if (!productData) {
+      log(`  [!!!] ВНИМАНИЕ: ОЗОН-товар с артикулом '${article}' не найден в МоемСкладе! Заказ [${header}] — проведите вручную.`);
+      continue;
+    }
+    const qtyMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()] || 1;
+    const shipQty = qty * qtyMultiplier;
+    if (qtyMultiplier !== 1) {
+      log(`  [OZON] Артикул '${article}' — это набор x${qtyMultiplier}: в отгрузку идёт ${shipQty} шт (${qty} шт заказа ОЗОН × ${qtyMultiplier}).`);
+    }
+    log(`  [OZON] Артикул '${article}' найден как '${productData.name}' (Кол-во: ${shipQty})`);
+    newItems.push({ quantity: shipQty, assortment: { meta: productData.meta }, price: productData.price, _name: productData.name });
+  }
+
+  if (!newItems.length) {
+    log(`  [ПРОПУСК] Ни один товар из заказа ОЗОН [${header}] не найден в МоемСкладе — отгрузка не создана.`);
+    return;
+  }
+
+  const demandResult = await createDemand(cId, newItems, reportDate, fullDesc);
   if (!demandResult) {
     log(`  [ОШИБКА API] МойСклад не смог создать отгрузку ОЗОН для [${header}].`);
     return;
@@ -860,8 +920,9 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
   log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${drSuffix()}`);
 
   // Цену/сумму из отчёта не сверяем (маркетплейс сам решает розничную цену) — платёж
-  // проводим ровно на сумму из отчёта, если она нашлась, иначе на сумму позиции.
-  const paymentSum = ozonPriceRub !== null ? pyRound(ozonPriceRub * 100) : (demandResult.sum !== undefined ? demandResult.sum : pyRound(newItem.quantity * newItem.price));
+  // проводим ровно на сумму из отчёта, если она нашлась, иначе на сумму позиций.
+  const itemsSum = pyRound(newItems.reduce((s, it) => s + it.quantity * it.price, 0));
+  const paymentSum = ozonPriceRub !== null ? pyRound(ozonPriceRub * 100) : (demandResult.sum !== undefined ? demandResult.sum : itemsSum);
 
   if (await paymentAlreadyExists(cId, reportDate, fullDesc)) {
     log(`  [ПРОПУСК] Входящий платёж ОЗОН для [${header}] уже есть в МоемСкладе — дубль не создаю.`);
@@ -930,12 +991,23 @@ async function processReport(reportTextRaw) {
       continue;
     }
 
+    // Иногда статус заказа ("ОПЛАЧЕН" и т.п.) случайно продублирован ЕЩЁ РАЗ отдельной
+    // строкой сразу после заголовка (человеческий фактор при копировании отчёта) —
+    // например заголовок "5. ОПЛАЧЕН", а следующая строка блока — снова просто "ОПЛАЧЕН".
+    // Без этой проверки такая строка ошибочно бралась за имя клиента, и контрагент в
+    // МоемСкладе создавался под именем "ОПЛАЧЕН" вместо настоящего. Пропускаем такие
+    // строки-дубликаты статуса при поиске строки с именем.
+    let nameIdx = 0;
+    while (nameIdx < lines.length - 1 && /^(не\s+)?опла[чт]ен[оа]?\.?$/i.test(lines[nameIdx].trim())) {
+      nameIdx++;
+    }
+
     let name;
-    if (/^\d+[)\.]\s+/.test(lines[0]) ||
-        (/\d+\s*(?:₽|руб)/.test(lines[0]) && !['итого', 'доставка'].some(x => lines[0].toLowerCase().includes(x)))) {
+    if (/^\d+[)\.]\s+/.test(lines[nameIdx]) ||
+        (/\d+\s*(?:₽|руб)/.test(lines[nameIdx]) && !['итого', 'доставка'].some(x => lines[nameIdx].toLowerCase().includes(x)))) {
       name = 'Без имени';
     } else {
-      name = lines[0];
+      name = lines[nameIdx];
     }
 
     let itemsSell = [];
