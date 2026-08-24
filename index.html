@@ -366,6 +366,13 @@ function findProductMeta(pRaw, weight) {
   const queryWords = query.split(/[^а-яa-z0-9]/).filter(w => w.length >= 3);
   const queryWordsFolded = queryWords.map(foldHomoglyphs);
 
+  // Собираем ЛУЧШЕГО кандидата по всему каталогу, а не возвращаем первого попавшегося
+  // (см. ниже про precision) — раньше первое совпадение, прошедшее порог, сразу
+  // возвращалось через return, и порядок перебора PRODUCTS_CACHE (по сути случайный,
+  // как отдаёт API) решал исход при нескольких подходящих карточках.
+  let best = null;
+  let bestPrecision = -1;
+
   for (const fullName in PRODUCTS_CACHE) {
     const data = PRODUCTS_CACHE[fullName];
     const nameLower = fullName.toLowerCase();
@@ -375,8 +382,19 @@ function findProductMeta(pRaw, weight) {
     const threshold = isHamon ? 1.0 : 0.67;
 
     if (queryWords.length > 0 && (matches / queryWords.length >= threshold)) {
-      if (weight && weight >= 0.4 && weight <= 0.6 && nameLower.includes('250') && !nameLower.includes('500')) continue;
-      if (weight && weight >= 0.2 && weight <= 0.3 && nameLower.includes('500') && !nameLower.includes('250')) continue;
+      // ВАЖНО: эти две проверки по фактическому взвешенному весу (250г vs 500г) задуманы
+      // ТОЛЬКО для линейки Rodriguez (там реально есть блоки на 250г и 500г, и в отчёте
+      // вес пишется по факту взвешивания куска, без явного "250гр"/"500гр" в тексте — то
+      // есть текстовый грамм-токен-гард выше тут не поможет, нужен сигнал по факту веса).
+      // Раньше проверка была БЕЗ этого ограничения и применялась ко ВСЕМ товарам — из-за
+      // этого совершенно не связанный товар "Ландана 500" (где "500" — просто часть
+      // названия, а не масса блока) при фактическом весе 0.295кг ошибочно исключался
+      // ("500" в названии есть, "250" нет), и товар не находился вовсе.
+      const isRodriguezFamily = nameLower.includes('родригес') || nameLower.includes('rodriguez');
+      if (isRodriguezFamily) {
+        if (weight && weight >= 0.4 && weight <= 0.6 && nameLower.includes('250') && !nameLower.includes('500')) continue;
+        if (weight && weight >= 0.2 && weight <= 0.3 && nameLower.includes('500') && !nameLower.includes('250')) continue;
+      }
       if (query.includes('родригес') && !nameLower.includes('родригес')) continue;
       // "Манчего DOP (18 мес)" (ВЕСОВОЙ, 420₽/100г) и "Манчего DOP (18 мес) 200гр"
       // (ШТУЧНАЯ фасовка, 1000₽/шт) — разные товары с почти одинаковым названием.
@@ -421,11 +439,29 @@ function findProductMeta(pRaw, weight) {
       const nameGramMatch = nameLower.match(gramRegex);
       if (queryGramMatch && nameGramMatch && queryGramMatch[1] !== nameGramMatch[1]) continue;
 
-      return { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price };
+      // Каталог часто содержит подарочные наборы/комплекты, чьё длинное название
+      // случайно включает в себя ВСЕ слова короткого запроса — например простой весовой
+      // сыр "Манчего DOP (12 мес)" (запрос: "манчего", "dop", "мес") целиком укладывается
+      // внутрь совсем другого товара "Набор Манчего с ножом и инжирным джемом 480гр (DOP
+      // 12мес, иберико 3 молока, трюфель...)" — там тоже находятся все 3 слова. Раньше
+      // побеждал ПЕРВЫЙ такой кандидат по порядку в кэше, то есть по сути случайно, и
+      // весовой сыр мог отгрузиться как подарочный набор (другой товар, другая логика
+      // списания склада). Чтобы выбрать самое ТОЧНОЕ совпадение, а не первое попавшееся,
+      // среди всех кандидатов, прошедших порог, выбираем того, чьё название само по себе
+      // наиболее полно "покрывается" словами запроса (precision = сколько слов из
+      // названия угадано запросом) — простой сыр, чьё название почти целиком совпадает с
+      // запросом, получает precision ~1.0, а набор с кучей лишних слов — низкий precision.
+      const nameWords = nameLowerFolded.split(/[^а-яa-z0-9]/).filter(w => w.length >= 3);
+      const precision = nameWords.length > 0 ? matches / nameWords.length : 0;
+
+      if (precision > bestPrecision) {
+        bestPrecision = precision;
+        best = { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price };
+      }
     }
   }
 
-  return null;
+  return best;
 }
 
 /* ===================== СКИДКИ ===================== */
@@ -1036,8 +1072,17 @@ async function processReport(reportTextRaw) {
     let itemsLoss = [];
     let lastItem = null;
 
+    // Строка со скидкой в процентах иногда пишется БЕЗ слова "Промокод"/"Скидка" —
+    // просто отдельной строкой вида "(−5%) = −785₽" сразу после "Подытог:". Такая
+    // строка содержит цену ("785₽"), поэтому без явного исключения проходила общую
+    // проверку isItem ниже и уходила в поиск товара, давая ложное "[!!!] ВНИМАНИЕ: Товар
+    // '(−5%) = −785₽' не найден!" — сама скидка при этом всё равно корректно применялась
+    // отдельной функцией detectDiscountPercent, это чисто лишнее предупреждение в логе.
+    const percentOnlyLineRegex = /^\(?\s*[-−]\s*\d{1,2}\s*%\s*\)?\s*=\s*[-−]?\s*\d+(?:[.,]\d+)?\s*(?:₽|руб)?\s*$/;
+
     for (const line of lines) {
       const lineLower = line.toLowerCase();
+      if (percentOnlyLineRegex.test(line.trim())) continue;
       const isItem = /^\d+[)\.]\s+/.test(line) || (
         /(\d+\s*(?:₽|руб)|\s+[-–—]\s*\d+\s*$|🎁|подарок|презент|\s+[-–—=]\s*0\s*(?:₽|руб)?\s*$)/.test(line) &&
         !['итого', 'подытог', 'доставк', 'скидка', 'выручка', 'оплат', 'промокод'].some(x => lineLower.includes(x))
@@ -1154,6 +1199,7 @@ async function processReport(reportTextRaw) {
     if (!itemsSell.length && !itemsLoss.length) {
       for (const line of lines.slice(1)) {
         const lineLower = line.toLowerCase();
+        if (percentOnlyLineRegex.test(line.trim())) continue;
         if (['итого', 'подытог', 'доставка', 'скидка', 'выручка', 'свз', 'сдэк', 'оплат', 'промокод'].some(x => lineLower.includes(x))) continue;
 
         const productData = findProductMeta(line, 1.0);
