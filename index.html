@@ -467,9 +467,27 @@ function findProductMeta(pRaw, weight) {
 /* ===================== СКИДКИ ===================== */
 
 function detectDiscountPercent(blockText) {
-  const textLower = blockText.toLowerCase();
+  // Строка описания ТОВАРА иногда содержит СВОЙ собственный процент скидки, привязанный
+  // именно к этой позиции — например "(4.14) * 295₽/100гр = 12213 ₽ [одним куском] - 15%
+  // = 10381" (компенсация за то, что кусок продан целиком, а не строго по заказанному
+  // весу — а не акция на весь заказ). Если искать "-N%" по ВСЕМУ тексту заказа без
+  // разбора, такая точечная скидка одной позиции ошибочно принимается за ОБЩУЮ скидку
+  // заказа и применяется КО ВСЕМ товарам, включая те, которых она вообще не касается.
+  // Поэтому процент ищем только в строках, которые НЕ являются описанием товара (не
+  // начинаются с номера позиции и не содержат "цена за 100г" внутри себя) — то есть в
+  // отдельных строках вида "Промокод: ...", "Скидка 15%", "(−5%) = −785₽" и т.п. Сама
+  // точечная скидка конкретной позиции обрабатывается отдельно, при разборе её строки.
+  const isItemLikeLine = (line) => /^\d+[)\.]\s+/.test(line) || /[*×]\s*\d+(?:[.,]\d+)?\s*(?:₽|руб)?\s*\/\s*100\s*г/i.test(line);
+  const nonItemText = blockText.split('\n').filter(l => !isItemLikeLine(l.trim())).join('\n');
+  const textLower = nonItemText.toLowerCase();
 
   let m = textLower.match(/(\d{1,2})\s*%\s*ск/);
+  if (m) return parseInt(m[1], 10);
+
+  // Ещё один порядок слов: "Скидка 5%" (слово "скидка" идёт ПЕРЕД числом, без минуса и
+  // без "%" сразу после слова "ск..." — та строка не совпадает ни с этим паттерном, ни с
+  // "-N%" ниже, и скидка молча не применялась вовсе, хотя менеджер её явно написал).
+  m = textLower.match(/скидк[а-яё]*\s*:?\s*(\d{1,2})\s*%/);
   if (m) return parseInt(m[1], 10);
 
   // ВАЖНО: минус перед процентом не всегда обычный дефис "-" (U+002D) — в промокодах
@@ -1226,11 +1244,21 @@ async function processReport(reportTextRaw) {
 
       if (!pRaw) continue;
 
+      // Иногда сама строка позиции заканчивается ГОТОВЫМ итогом с уже применённой личной
+      // скидкой на ЭТУ позицию — например "(4.14) * 295₽/100гр = 12213 ₽ [одним куском] -
+      // 15% = 10381" (компенсация за то, что кусок продан целиком, а не строго по
+      // заказанному весу — а не скидка на весь заказ). detectDiscountPercent теперь не
+      // подхватывает такие built-in-в-строку проценты как общую скидку заказа (см. её
+      // комментарий), но саму цену ЭТОЙ позиции всё равно нужно взять по факту "= 10381",
+      // а не по ставке ДО скидки — и пометить как уже сниженную, чтобы скидка заказа (если
+      // она есть у других позиций) не применилась к ней ещё раз.
+      const itemDiscountMatch = content.match(/[-–—]\s*\d{1,2}\s*%\s*=\s*(\d+(?:[.,]\d+)?)\s*(?:₽|руб)?\s*$/i);
+
       // Пометка "[SALE]" на позиции означает, что ЭТОТ товар уже отпущен по акционной
       // (сниженной) цене сам по себе — обычная автоскидка на заказ (промокод/процент) не
       // должна применяться к нему ЕЩЁ РАЗ поверх уже сниженной цены. Ловим тег ДО того, как
       // findProductMeta нормализует название и "[SALE]" потеряется вместе с остальным текстом.
-      const alreadyDiscounted = /\[\s*sale\s*\]/i.test(pRaw);
+      const alreadyDiscounted = /\[\s*sale\s*\]/i.test(pRaw) || !!itemDiscountMatch;
 
       const productData = findProductMeta(pRaw, weight);
       if (!productData) {
@@ -1245,12 +1273,18 @@ async function processReport(reportTextRaw) {
         lastItem = newItem;
       } else {
         let sellPrice = productData.price;
-        const textPrice = extractTextPrice(content);
-        if (textPrice !== null) {
-          reportPriceMismatch(productData.name, textPrice, productData.price);
-          sellPrice = textPrice;
+        if (itemDiscountMatch) {
+          const finalTotalRub = parseFloat(itemDiscountMatch[1].replace(',', '.'));
+          sellPrice = pyRound((finalTotalRub / (weight || 1)) * 100);
+          reportPriceMismatch(productData.name, sellPrice, productData.price);
+        } else {
+          const textPrice = extractTextPrice(content);
+          if (textPrice !== null) {
+            reportPriceMismatch(productData.name, textPrice, productData.price);
+            sellPrice = textPrice;
+          }
         }
-        log(`  [OK] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [SALE — не участвует в автоскидке]' : ''}`);
+        log(`  [OK] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [уже со скидкой — не участвует в автоскидке заказа]' : ''}`);
         const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: sellPrice, _name: productData.name, _catalog_price: productData.price, _alreadyDiscounted: alreadyDiscounted };
         itemsSell.push(newItem);
         lastItem = newItem;
