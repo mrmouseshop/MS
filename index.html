@@ -777,13 +777,27 @@ function extractReportTotalKopecks(blockText) {
     // но при этом строк "Итого:" НЕСКОЛЬКО (несколько под-заказов под одним клиентом без
     // явного общего итога), складываем ВСЕ такие строки — это то, что реально причитается
     // к оплате за весь блок целиком. Если строка "Итого:" всего одна — поведение как раньше.
-    const itogoLineRegex = new RegExp(NOT_LETTER_BEFORE + 'итого' + NOT_LETTER_AFTER + '\\s*:?\\s*(.+)', 'gi');
-    let im;
+    // ВАЖНО: менеджер иногда дублирует ОДНУ И ТУ ЖЕ сумму — сначала как "превью" сразу
+    // после заголовка заказа (ДО списка товаров), а затем ещё раз как настоящий итог ПОСЛЕ
+    // списка товаров и доставки. Если считать обе строки, сумма задвоится (наблюдалось на
+    // реальном отчёте: "Итого: 12000₽" дважды -> ложные 24000 вместо 12000). Поэтому строка
+    // "Итого:" учитывается в сумме только если ДО неё в блоке уже встретилась хотя бы одна
+    // пронумерованная строка товара ("1. ...", "2) ..." и т.п.) — то есть это итог уже
+    // ПОСЛЕ перечисления товаров, а не предварительный анонс суммы.
+    const blockLines = blockText.split('\n');
+    const itemLineRegex = /^\s*\d+[)\.]\s+/;
+    const itogoLineOnlyRegex = new RegExp(NOT_LETTER_BEFORE + 'итого' + NOT_LETTER_AFTER + '\\s*:?\\s*(.+)', 'i');
+    let seenItemLine = false;
     let sumRub = 0;
     let count = 0;
-    while ((im = itogoLineRegex.exec(blockText)) !== null) {
-      const val = extractOneTotalRub(im[1]);
-      if (val !== null) { sumRub += val; count++; }
+    for (const rawLine of blockLines) {
+      if (itemLineRegex.test(rawLine)) { seenItemLine = true; continue; }
+      if (!seenItemLine) continue;
+      const im = rawLine.match(itogoLineOnlyRegex);
+      if (im) {
+        const val = extractOneTotalRub(im[1]);
+        if (val !== null) { sumRub += val; count++; }
+      }
     }
     if (count > 0) itogoRub = sumRub;
   }
@@ -814,6 +828,22 @@ function extractReportTotalKopecks(blockText) {
     const dLine = dLineMatch[0].replace(/\([^)]*\)/g, ' ');
     const dNums = dLine.match(/\d+(?:[.,]\d+)?/g);
     if (dNums && dNums.length) deliveryRub = parseFloat(dNums[dNums.length - 1].replace(',', '.'));
+  }
+
+  // Иногда "Итого:" в отчёте — это сумма ТОЛЬКО за товары (ДО добавления доставки), а
+  // реальный итог с доставкой указан отдельно в "К оплате:" (например "Итого: 7189₽" +
+  // "Доставка: 211₽" = "К оплате: 7400"). В большинстве же других заказов "Итого:" уже
+  // ВКЛЮЧАЕТ доставку, и тогда вычитание доставки из Итого как раз даёт нужную сумму за
+  // товары. Различить эти два случая можно по формуле: если "К оплате" ПРИМЕРНО равно
+  // "Итого" + "Доставка" (с точностью до рубля округления), значит доставка ещё не была
+  // прибавлена к Итого — и тогда её вычитать из Итого НЕ нужно (иначе доставка спишется
+  // дважды и появится ложное расхождение при сверке).
+  const mKOplateCheck = blockText.match(new RegExp(NOT_LETTER_BEFORE + 'к\\s+оплате' + NOT_LETTER_AFTER + '\\s*:?\\s*(.+)', 'i'));
+  if (mKOplateCheck) {
+    const kOplateRub = extractOneTotalRub(mKOplateCheck[1]);
+    if (kOplateRub !== null && Math.abs((itogoRub + deliveryRub) - kOplateRub) < 1) {
+      deliveryRub = 0;
+    }
   }
 
   // "Мусорные" суммы (не товар, вычитаются из Итого): аккумулятор холода/термопакет
@@ -1171,6 +1201,20 @@ async function processReport(reportTextRaw) {
       if (!isItem) continue;
 
       let content = line.replace(/^\d+[)\.]\s*/, '').trim();
+
+      // Условный подарок по порогу суммы заказа, например
+      // "*На заказ от 12 000 ₽ - Крем сыр Камамбер "spanish cheese" 125гр🎁" или
+      // "🎁*На заказ от 15 000 ₽  - Камамбер Käserei 125гр". Здесь "12 000 ₽"/"15 000 ₽" —
+      // это ПОРОГ суммы заказа (условие, при котором дают этот подарок), а НЕ цена
+      // товара. Без этой проверки строка обрабатывалась общей логикой ниже, которая
+      // ошибочно разрезала название по этому числу как будто это цена позиции — в лог
+      // попадало "Товар '*На заказ от 12' не найден!", а сам подарок вообще не списывался.
+      // Заменяем content на реальное название товара ПОСЛЕ порога — дальше строка
+      // обрабатывается как обычная позиция (isGift всё равно распознается ниже по "🎁").
+      const thresholdGiftMatch = content.match(/на\s+заказ\s+от\s+[\d\s.,]+\s*(?:₽|руб)?\s*[-–—]\s*(.+)/i);
+      if (thresholdGiftMatch) {
+        content = thresholdGiftMatch[1].trim();
+      }
 
       const bracketMatch = content.match(/\(([ \d.+]+)\)/);
       let weight;
