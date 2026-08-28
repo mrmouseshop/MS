@@ -1030,17 +1030,6 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     return;
   }
 
-  // Сумма может быть написана с пробелом-разделителем тысяч ("1 300 ₽") — убираем пробелы
-  // внутри числа перед разбором.
-  let ozonPriceRub = null;
-  for (const line of lines) {
-    const m = line.match(/^([\d\s]+(?:[.,]\d+)?)\s*₽\s*$/);
-    if (m) {
-      ozonPriceRub = parseFloat(m[1].replace(/\s/g, '').replace(',', '.'));
-      break;
-    }
-  }
-
   const cId = await getOrCreateCounterparty(cpRaw, '');
   if (!cId) return;
 
@@ -1087,10 +1076,13 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
   }
   log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${drSuffix()}`);
 
-  // Цену/сумму из отчёта не сверяем (маркетплейс сам решает розничную цену) — платёж
-  // проводим ровно на сумму из отчёта, если она нашлась, иначе на сумму позиций.
+  // ВАЖНО: для заказов ОЗОН сумму/"Итого", написанную в самом отчёте, ИГНОРИРУЕМ
+  // полностью — она отражает розничную цену маркетплейса, а не то, что реально должно
+  // списаться в МоемСкладе. Отгружаем и проводим платёж строго по каталожной цене товара
+  // (как уже стоит в позициях newItems выше) — то есть "как есть в МоемСкладе", без
+  // подгонки суммы под число из отчёта.
   const itemsSum = pyRound(newItems.reduce((s, it) => s + it.quantity * it.price, 0));
-  const paymentSum = ozonPriceRub !== null ? pyRound(ozonPriceRub * 100) : (demandResult.sum !== undefined ? demandResult.sum : itemsSum);
+  const paymentSum = demandResult.sum !== undefined ? demandResult.sum : itemsSum;
 
   if (await paymentAlreadyExists(cId, reportDate, fullDesc)) {
     log(`  [ПРОПУСК] Входящий платёж ОЗОН для [${header}] уже есть в МоемСкладе — дубль не создаю.`);
