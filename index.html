@@ -50,6 +50,7 @@
   #log .l-gift { color: #f0abfc; }
   #log .l-skip { color: #9ca3af; }
   #log .l-success { color: #4ade80; font-weight: 600; }
+  #log .l-pending { color: #fb923c; font-weight: 600; }
   #log .l-info { color: #d8dbe0; }
   #log .l-header { color: #fff; font-weight: 700; margin-top: 4px; }
   .toolbar { display: flex; gap: 8px; margin-top: 10px; }
@@ -177,6 +178,11 @@ function log(msg) {
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
   else if (msg.includes('🎁') || msg.includes('ПОДАРОК')) cls = 'l-gift';
+  // ОЗОН-заказы "ожидает сборки/отгрузки" — отгрузка создана, но НЕ проведена и без платежа
+  // (см. processMarketplaceOrder). Красим отдельным цветом (⏳), ДО общей проверки "=>",
+  // чтобы такая отгрузка визуально не сливалась с обычной успешно проведённой (l-success) —
+  // на неё нужно обратить внимание и вернуться к ней в МоемСкладе, когда заказ будет собран.
+  else if (msg.includes('⏳')) cls = 'l-pending';
   else if (msg.includes('[ПРОПУСК]')) cls = 'l-skip';
   else if (msg.trim().startsWith('=>')) cls = 'l-success';
   else if (!msg.startsWith(' ') && !msg.startsWith('Дата отгрузок')) cls = 'l-header';
@@ -1091,12 +1097,15 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     log(`  [ОШИБКА API] МойСклад не смог создать отгрузку ОЗОН для [${header}].`);
     return;
   }
-  log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${isPendingStatus ? ' [НЕ ПРОВЕДЕНА — статус "ожидает сборки/отгрузки"]' : ''}${drSuffix()}`);
-
   if (isPendingStatus) {
-    log(`  [OZON] Заказ [${header}] ещё не собран/не отгружен — платёж НЕ создаётся, отгрузка оставлена непроведённой до готовности.`);
+    // ⏳ — отдельный маркер (см. классификатор log() выше): красим оранжевым, а не зелёным,
+    // как обычную успешную отгрузку, чтобы такие заказы бросались в глаза в журнале и их не
+    // забыли провести/оплатить вручную в МоемСкладе, когда заказ реально соберут/отгрузят.
+    log(`  ⏳ Отгрузка ОЗОН [${header}] (${cpRaw}) СОЗДАНА, НО НЕ ПРОВЕДЕНА — статус "ожидает сборки/отгрузки". Платёж не создан — вернитесь к заказу, когда он будет собран/отгружен.${drSuffix()}`);
     return;
   }
+
+  log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${drSuffix()}`);
 
   // ВАЖНО: для заказов ОЗОН сумму/"Итого", написанную в самом отчёте, ИГНОРИРУЕМ
   // полностью — она отражает розничную цену маркетплейса, а не то, что реально должно
