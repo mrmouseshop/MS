@@ -875,10 +875,15 @@ function stripInternalFields(items) {
   });
 }
 
-async function createDemand(cId, items, dateStr, descText) {
+// ВАЖНО: параметр opts.applicable (по умолчанию true) управляет галочкой "проведено" в
+// МоемСкладе. Заказы ОЗОН в статусе "ожидает сборки"/"ожидает отгрузки" ещё не готовы к
+// фактической отправке — отгрузку заводим (чтобы был документ с позициями), но НЕПРОВЕДЁННОЙ,
+// чтобы она не списывала товар со склада раньше времени; см. processMarketplaceOrder.
+async function createDemand(cId, items, dateStr, descText, opts) {
+  const applicable = !opts || opts.applicable !== false;
   if (DRY_RUN) {
     const sum = pyRound(items.reduce((s, it) => s + it.quantity * it.price * (1 - (it.discount || 0) / 100), 0));
-    return { meta: { href: 'dryrun-demand-' + Math.random().toString(36).slice(2, 10) }, sum };
+    return { meta: { href: 'dryrun-demand-' + Math.random().toString(36).slice(2, 10) }, sum, applicable };
   }
   const payload = {
     organization: { meta: { href: `${MS_BASE}/entity/organization/${CONFIG.orgId}`, type: 'organization' } },
@@ -886,6 +891,7 @@ async function createDemand(cId, items, dateStr, descText) {
     store: { meta: { href: `${MS_BASE}/entity/store/${CONFIG.storeId}`, type: 'store' } },
     moment: `${dateStr} 12:00:00`,
     description: descText,
+    applicable,
     positions: stripInternalFields(items),
   };
   const resp = await fetch(apiUrl('/entity/demand'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
@@ -1013,6 +1019,17 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
   // в МоемСкладе и повторный прогон отчёта не пытался обработать этот заказ снова.
   const isCancelled = lines.some(l => /отмен[её]н/i.test(l));
 
+  // Статусы "Ожидает сборки" и "Ожидает отгрузки" — заказ ОЗОН ещё не собран/не передан в
+  // доставку, товар физически ещё на складе. Отгрузку заводим уже сейчас (чтобы позиции были
+  // видны), но галочку "проведено" оставляем СНЯТОЙ (непроведённый документ не списывает товар
+  // со склада) и входящий платёж НЕ создаём — деньги/факт отгрузки ещё не подтверждены.
+  // ВАЖНО: проверка дублей (demandAlreadyExists ниже) находит документ по тексту заказа — если
+  // тот же заказ попадёт в следующий отчёт уже с финальным статусом ("Доставляется" и т.п.), он
+  // будет распознан как уже существующий и просто пропущен, а НЕ дозаведён платежом
+  // автоматически. Когда статус в реальности сменится, документ нужно будет проверить/провести
+  // и добавить платёж вручную в МоемСкладе (или удалить черновик и прогнать отчёт заново).
+  const isPendingStatus = lines.some(l => /ожидает\s+(?:сборки|отгрузки)/i.test(l));
+
   // Иногда в ОДНОМ заказе ОЗОН склеено НЕСКОЛЬКО разных товаров — каждая пара
   // "N шт, артикул" на своей строке — а не только одна позиция. Раньше бралась только
   // ПЕРВАЯ такая строка (break сразу после неё), и вторая/третья позиция тихо терялась —
@@ -1069,12 +1086,17 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     return;
   }
 
-  const demandResult = await createDemand(cId, newItems, reportDate, fullDesc);
+  const demandResult = await createDemand(cId, newItems, reportDate, fullDesc, { applicable: !isPendingStatus });
   if (!demandResult) {
     log(`  [ОШИБКА API] МойСклад не смог создать отгрузку ОЗОН для [${header}].`);
     return;
   }
-  log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${drSuffix()}`);
+  log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${isPendingStatus ? ' [НЕ ПРОВЕДЕНА — статус "ожидает сборки/отгрузки"]' : ''}${drSuffix()}`);
+
+  if (isPendingStatus) {
+    log(`  [OZON] Заказ [${header}] ещё не собран/не отгружен — платёж НЕ создаётся, отгрузка оставлена непроведённой до готовности.`);
+    return;
+  }
 
   // ВАЖНО: для заказов ОЗОН сумму/"Итого", написанную в самом отчёте, ИГНОРИРУЕМ
   // полностью — она отражает розничную цену маркетплейса, а не то, что реально должно
