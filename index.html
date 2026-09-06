@@ -175,7 +175,7 @@ function log(msg) {
   let cls = 'l-info';
   if (msg.includes('[OK]')) cls = 'l-ok';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН')) cls = 'l-warn';
-  else if (msg.includes('[!!!]') || msg.includes('ОШИБКА')) cls = 'l-error';
+  else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
   else if (msg.includes('🎁') || msg.includes('ПОДАРОК')) cls = 'l-gift';
   // ОЗОН-заказы "ожидает сборки/отгрузки" — отгрузка создана, но НЕ проведена и без платежа
