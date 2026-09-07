@@ -1017,7 +1017,7 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'theramedoriginal3': 3,
 };
 
-async function processMarketplaceOrder(header, block, lines, reportDate) {
+async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0 }) {
   const cpRaw = lines[0] || 'OZON';
   const fullDesc = `${header}\n${block.trim()}`;
 
@@ -1097,6 +1097,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
   const demandResult = await createDemand(cId, newItems, reportDate, fullDesc, { applicable: !isPendingStatus });
   if (!demandResult) {
     log(`  [ОШИБКА API] МойСклад не смог создать отгрузку ОЗОН для [${header}].`);
+    stats.missingPayments++;
     return;
   }
   if (isPendingStatus) {
@@ -1104,6 +1105,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     // как обычную успешную отгрузку, чтобы такие заказы бросались в глаза в журнале и их не
     // забыли провести/оплатить вручную в МоемСкладе, когда заказ реально соберут/отгрузят.
     log(`  ⏳ Отгрузка ОЗОН [${header}] (${cpRaw}) СОЗДАНА, НО НЕ ПРОВЕДЕНА — статус "ожидает сборки/отгрузки". Платёж не создан — вернитесь к заказу, когда он будет собран/отгружен.${drSuffix()}`);
+    stats.missingPayments++;
     return;
   }
 
@@ -1125,6 +1127,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate) {
     log(`  => 💰 Входящий платёж ОЗОН на ${(paymentSum / 100).toFixed(2)} ₽ для [${header}] создан.${drSuffix()}`);
   } else {
     log(`  [ОШИБКА API] МойСклад не смог создать платёж ОЗОН для [${header}].`);
+    stats.missingPayments++;
   }
 }
 
@@ -1171,6 +1174,11 @@ async function processReport(reportTextRaw) {
 
   log(`Дата отгрузок: ${reportDate}. Найдено заказов: ${orders.length}`);
 
+  // Сводная статистика по всему запуску — печатается коротким блоком в самом конце
+  // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
+  // несостыковок/непроведённых платежей вручную.
+  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0 };
+
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
     if (!lines.length) continue;
@@ -1180,7 +1188,7 @@ async function processReport(reportTextRaw) {
     // используем его же как контрагента), товар ищем по АРТИКУЛУ (не по названию),
     // а цену/сумму из отчёта не проверяем — просто проводим платёж на неё.
     if (/ОЗОН/i.test(header)) {
-      await processMarketplaceOrder(header, block, lines, reportDate);
+      await processMarketplaceOrder(header, block, lines, reportDate, stats);
       continue;
     }
 
@@ -1475,6 +1483,7 @@ async function processReport(reportTextRaw) {
             const reportKop = extractReportTotalKopecks(block);
             if (reportKop === null) {
               log(`  [ПЛАТЁЖ] В заказе не нашлась строка 'Итого' для сверки — платёж не создаю, проведите вручную.`);
+              stats.missingPayments++;
             } else {
               // Допуск на автосоздание платежа: до 100 ₽ (или 0.1% для крупных сумм, что больше) —
               // мелкая погрешность округления больше не блокирует платёж. Но о ЛЮБОМ ненулевом
@@ -1489,6 +1498,8 @@ async function processReport(reportTextRaw) {
                 log(`  [❗НЕСОСТЫКОВКА] Сумма по позициям (${(calculatedKop / 100).toFixed(2)} ₽) не совпадает с 'Итого' в отчёте ` +
                     `за вычетом доставки/мусора (${(reportKop / 100).toFixed(2)} ₽, разница ${sign}${(diffKop / 100).toFixed(2)} ₽). ` +
                     `Заказ [${header}] (${name}) — проверьте, пожалуйста.`);
+                stats.mismatchKop += Math.abs(diffKop);
+                stats.mismatchOrders++;
               }
 
               if (Math.abs(diffKop) <= toleranceKop) {
@@ -1501,13 +1512,16 @@ async function processReport(reportTextRaw) {
                       `${hasMismatch ? ' (в пределах допустимой погрешности — см. уведомление выше)' : ' (сумма позиций совпала с отчётом)'}.${drSuffix()}`);
                 } else {
                   log(`  [ОШИБКА API] МойСклад не смог создать платёж для '${name}'.`);
+                  stats.missingPayments++;
                 }
               } else {
                 log(`  [ПЛАТЁЖ НЕ СОЗДАН] Расхождение больше допустимого предела (${(toleranceKop / 100).toFixed(2)} ₽) — платёж не создаю, проведите оплату вручную.`);
+                stats.missingPayments++;
               }
             }
           } else {
             log(`  [ОШИБКА API] МойСклад не смог создать отгрузку для '${name}'.`);
+            stats.missingPayments++;
           }
         }
       }
@@ -1521,11 +1535,33 @@ async function processReport(reportTextRaw) {
         log(`  [ПРОПУСК] Списание подарков для [${header}] (${name}) уже есть в МоемСкладе — дубль не создаю.`);
       } else if (await createLoss(itemsLoss, reportDate, fullDesc)) {
         log(`  => 🎁 Списание подарков для [${header}] (${name}) успешно создано!${drSuffix()}`);
+        stats.lossDocs++;
       } else {
         log(`  [ОШИБКА API] МойСклад не смог создать списание подарков для '${name}'.`);
       }
     }
   }
+
+  // --- КОРОТКИЙ ИТОГОВЫЙ ОТЧЁТ ПО ЗАПУСКУ ---
+  // Печатается перед 'Готово.', чтобы не листать весь журнал вручную в поисках
+  // несостыковок/непроведённых платежей. Специально переиспользуем те же слова-маркеры,
+  // что и классификатор цвета log() выше ("НЕСОСТЫКОВКА" -> красный, "ПЛАТЁЖ НЕ СОЗДАН" ->
+  // янтарный, "[OK]" -> зелёный), чтобы строки сводки сразу подсвечивались тем же цветом,
+  // что и обычные детальные строки того же смысла — без добавления новых CSS-классов.
+  log('');
+  log('=== ИТОГИ ЗАПУСКА ===');
+  if (stats.mismatchOrders > 0) {
+    log(`  ❗ НЕСОСТЫКОВКА (сводно): ${stats.mismatchOrders} заказ(ов) с расхождением суммы, итого на ${(stats.mismatchKop / 100).toFixed(2)} ₽ — см. отмеченные заказы выше.`);
+  } else {
+    log(`  [OK] Несостыковок по суммам за этот запуск не обнаружено.`);
+  }
+  if (stats.missingPayments > 0) {
+    log(`  ПЛАТЁЖ НЕ СОЗДАН (сводно): ${stats.missingPayments} заказ(ов) без входящего платежа — создайте вручную в МоемСкладе.`);
+  } else {
+    log(`  [OK] Все входящие платежи созданы автоматически.`);
+  }
+  log(`  Списаний (подарков) создано: ${stats.lossDocs}`);
+  log('');
 
   log('Готово.');
 }
