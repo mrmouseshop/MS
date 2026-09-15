@@ -587,7 +587,7 @@ function extractTextPrice(content) {
   return pyRound(priceRub * 100);
 }
 
-function reportPriceMismatch(productName, textPriceKop, catalogPriceKop) {
+function reportPriceMismatch(productName, textPriceKop, catalogPriceKop, stats) {
   const tolerance = Math.max(100, catalogPriceKop * 0.01);
   if (Math.abs(textPriceKop - catalogPriceKop) > tolerance) {
     const diffRub = (textPriceKop - catalogPriceKop) / 100;
@@ -595,6 +595,14 @@ function reportPriceMismatch(productName, textPriceKop, catalogPriceKop) {
     log(`  [❗ПРОВЕРЬТЕ ЦЕНУ] '${productName}': в отчёте ${(textPriceKop / 100).toFixed(2)} ₽, в МоемСкладе ${(catalogPriceKop / 100).toFixed(2)} ₽ ` +
         `(разница ${sign}${diffRub.toFixed(2)} ₽). В документ поставлена цена ИЗ ОТЧЁТА — ` +
         `проверьте, не ошибся ли менеджер или не занизил цену.`);
+    // Считаем в сводку итогов запуска (см. '=== ИТОГИ ЗАПУСКА ===' в processReport) — расхождение
+    // цены иногда сигналит не об опечатке менеджера, а о том, что findProductMeta подставил
+    // СОВСЕМ ДРУГОЙ товар (нечёткий поиск ошибся карточкой) — такое легко потерять в длинном
+    // журнале, поэтому считаем и печатаем итог отдельной строкой, как и остальные несостыковки.
+    if (stats) {
+      stats.priceCheckCount = (stats.priceCheckCount || 0) + 1;
+      stats.priceCheckDiffKop = (stats.priceCheckDiffKop || 0) + Math.abs(textPriceKop - catalogPriceKop);
+    }
   }
 }
 
@@ -1020,7 +1028,7 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'special_and_deleitum_150g': 2,
 };
 
-async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0 }) {
+async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0 }) {
   const cpRaw = lines[0] || 'OZON';
   const fullDesc = `${header}\n${block.trim()}`;
 
@@ -1180,7 +1188,7 @@ async function processReport(reportTextRaw) {
   // Сводная статистика по всему запуску — печатается коротким блоком в самом конце
   // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
   // несостыковок/непроведённых платежей вручную.
-  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0 };
+  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0 };
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
@@ -1311,7 +1319,7 @@ async function processReport(reportTextRaw) {
         const contPrice = extractTextPrice(content);
         if (contPrice !== null) {
           const catalogPrice = lastItem._catalog_price !== undefined ? lastItem._catalog_price : contPrice;
-          reportPriceMismatch(lastItem._name || '?', contPrice, catalogPrice);
+          reportPriceMismatch(lastItem._name || '?', contPrice, catalogPrice, stats);
           lastItem.price = contPrice;
           priceNote = `, цена -> ${(contPrice / 100).toFixed(2)} ₽`;
         }
@@ -1369,11 +1377,11 @@ async function processReport(reportTextRaw) {
         if (itemDiscountMatch) {
           const finalTotalRub = parseFloat(itemDiscountMatch[1].replace(',', '.'));
           sellPrice = pyRound((finalTotalRub / (weight || 1)) * 100);
-          reportPriceMismatch(productData.name, sellPrice, productData.price);
+          reportPriceMismatch(productData.name, sellPrice, productData.price, stats);
         } else {
           const textPrice = extractTextPrice(content);
           if (textPrice !== null) {
-            reportPriceMismatch(productData.name, textPrice, productData.price);
+            reportPriceMismatch(productData.name, textPrice, productData.price, stats);
             sellPrice = textPrice;
           }
         }
@@ -1396,7 +1404,7 @@ async function processReport(reportTextRaw) {
           let fallbackPrice = productData.price;
           const textPrice = extractTextPrice(line);
           if (textPrice !== null) {
-            reportPriceMismatch(productData.name, textPrice, productData.price);
+            reportPriceMismatch(productData.name, textPrice, productData.price, stats);
             fallbackPrice = textPrice;
           }
           const alreadyDiscounted = /\[\s*sale\s*\]/i.test(line);
@@ -1562,6 +1570,15 @@ async function processReport(reportTextRaw) {
     log(`  ПЛАТЁЖ НЕ СОЗДАН (сводно): ${stats.missingPayments} заказ(ов) без входящего платежа — создайте вручную в МоемСкладе.`);
   } else {
     log(`  [OK] Все входящие платежи созданы автоматически.`);
+  }
+  if (stats.priceCheckCount > 0) {
+    // Расхождение цены "в отчёте" vs "в МоемСкладе" иногда означает не опечатку менеджера, а
+    // то, что нечёткий поиск товара (findProductMeta) подставил ДРУГУЮ карточку — см. комментарий
+    // в reportPriceMismatch. Выносим в сводку тем же маркером "❗ПРОВЕРЬТЕ ЦЕНУ", что и у
+    // детальных строк выше, чтобы получить тот же янтарный цвет через общий классификатор.
+    log(`  ❗ПРОВЕРЬТЕ ЦЕНУ (сводно): ${stats.priceCheckCount} позици(й) с расхождением цены на общую сумму ${(stats.priceCheckDiffKop / 100).toFixed(2)} ₽ — см. отмеченные позиции выше (возможно, найден не тот товар).`);
+  } else {
+    log(`  [OK] Расхождений цены (отчёт vs МойСклад) за этот запуск не обнаружено.`);
   }
   log(`  Списаний (подарков) создано: ${stats.lossDocs}`);
   log('');
