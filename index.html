@@ -53,6 +53,8 @@
   #log .l-pending { color: #fb923c; font-weight: 600; }
   #log .l-info { color: #d8dbe0; }
   #log .l-header { color: #fff; font-weight: 700; margin-top: 4px; }
+  #log .l-link a { color: #60a5fa; text-decoration: underline; }
+  #log .l-link a:active { opacity: 0.7; }
   .toolbar { display: flex; gap: 8px; margin-top: 10px; }
   .toolbar button { margin-top: 0; flex: 1; padding: 10px; font-size: 13px; }
   .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: #eee; color: #555; margin-left: 6px; }
@@ -190,6 +192,27 @@ function log(msg) {
   const line = document.createElement('div');
   line.className = cls;
   line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Кликабельная ссылка в журнале — например, на реально созданный документ в МоемСкладе
+// (вместо скриншота: настоящую страницу МойСклад из этого приложения не сделать без
+// отдельного headless-браузера и хранения логина/пароля от сайта, а не API-токена —
+// договорились вместо этого просто давать прямую ссылку на документ).
+function logLink(msg, url) {
+  console.log(msg, url);
+  logLines++;
+  logCountEl.textContent = logLines + ' строк';
+
+  const line = document.createElement('div');
+  line.className = 'l-link';
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.textContent = msg;
+  line.appendChild(a);
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -851,7 +874,15 @@ function extractReportTotalKopecks(blockText) {
   // пункт отправления СДЭК из Москвы - 250 (комиссия по условиям магазина)". Поэтому
   // берём ПОСЛЕДНЕЕ число во всей строке "Доставка..." (после удаления скобок), а не
   // требуем, чтобы число шло сразу после слова "доставка".
-  const dLineMatch = blockText.match(new RegExp(NOT_LETTER_BEFORE + 'доставк[а-яё]*[^\\n]*', 'i'));
+  //
+  // ВАЖНО: строка обязательно должна НАЧИНАТЬСЯ со слова "доставк..." (после
+  // необязательных пробелов) — раньше искали "доставк..." ГДЕ УГОДНО в блоке, и это
+  // ошибочно попадало на строку "День доставки: 23.09.26" (там есть отдельная дата
+  // доставки, а не её стоимость!), если она шла в отчёте РАНЬШЕ настоящей строки
+  // "Доставка: 680₽". Число "26" (конец даты "23.09.26") тогда принималось за стоимость
+  // доставки вместо 680 — и это ломало сверку суммы по позициям с "Итого" (ложная
+  // "[❗НЕСОСТЫКОВКА]" и заблокированный платёж на ровном месте).
+  const dLineMatch = blockText.match(new RegExp('^[^\\S\\n]*доставк[а-яё]*[^\\n]*', 'im'));
   if (dLineMatch) {
     const dLine = dLineMatch[0].replace(/\([^)]*\)/g, ' ');
     const dNums = dLine.match(/\d+(?:[.,]\d+)?/g);
@@ -954,7 +985,13 @@ async function createLoss(items, dateStr, descText) {
     positions: stripInternalFields(items),
   };
   const resp = await fetch(apiUrl('/entity/loss'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
-  if (resp.status === 200 || resp.status === 201) return true;
+  if (resp.status === 200 || resp.status === 201) {
+    // Возвращаем id созданного документа (не просто true), чтобы вызывающий код мог
+    // сразу дать пользователю прямую ссылку на настоящую страницу документа в МоемСкладе —
+    // взамен скриншота, который здесь не сделать (см. комментарий у logLink выше).
+    const data = await resp.json();
+    return { id: data.id };
+  }
   log(`  !!! ОШИБКА СОЗДАНИЯ СПИСАНИЯ (Код ${resp.status}): ${await resp.text()}`);
   return false;
 }
@@ -1575,11 +1612,17 @@ async function processReport(reportTextRaw) {
       const fullLossDesc = `🎁 Списание подарков по заказу:\n${fullDesc}`;
       if (await lossAlreadyExists(reportDate, fullLossDesc)) {
         log(`  [ПРОПУСК] Списание подарков для [${header}] (${name}) уже есть в МоемСкладе — дубль не создаю.`);
-      } else if (await createLoss(itemsLoss, reportDate, fullDesc)) {
-        log(`  => 🎁 Списание подарков для [${header}] (${name}) успешно создано!${drSuffix()}`);
-        stats.lossDocs++;
       } else {
-        log(`  [ОШИБКА API] МойСклад не смог создать списание подарков для '${name}'.`);
+        const lossResult = await createLoss(itemsLoss, reportDate, fullDesc);
+        if (lossResult) {
+          log(`  => 🎁 Списание подарков для [${header}] (${name}) успешно создано!${drSuffix()}`);
+          if (lossResult.id) {
+            logLink('     📄 Открыть документ в МоемСкладе →', `https://online.moysklad.ru/app/#loss/edit?id=${lossResult.id}`);
+          }
+          stats.lossDocs++;
+        } else {
+          log(`  [ОШИБКА API] МойСклад не смог создать списание подарков для '${name}'.`);
+        }
       }
     }
   }
