@@ -58,6 +58,13 @@
   .toolbar { display: flex; gap: 8px; margin-top: 10px; }
   .toolbar button { margin-top: 0; flex: 1; padding: 10px; font-size: 13px; }
   .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: #eee; color: #555; margin-left: 6px; }
+  .pending-item {
+    border: 1px solid #fed7aa; background: #fff7ed; border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; font-size: 13px; line-height: 1.5;
+  }
+  .pending-item b { color: #9a3412; }
+  .pending-item a { display: block; margin-top: 6px; color: #c2410c; font-weight: 600; text-decoration: underline; }
+  .pending-item button { margin-top: 8px; padding: 8px 12px; font-size: 13px; width: 100%; }
 </style>
 </head>
 <body>
@@ -96,6 +103,12 @@
     </label>
     <button id="processBtn">Провести ▶</button>
     <p id="status"></p>
+  </div>
+
+  <div class="card">
+    <h2>⏳ Ждут сборки/отгрузки (ОЗОН) <span class="badge" id="pendingOzonCount">пусто</span></h2>
+    <p class="hint">Заказы ОЗОН со статусом «Ожидает сборки»/«Ожидает отгрузки» — отгрузка в МоемСкладе уже создана (но не проведена, без оплаты). Список сохраняется в этом браузере между запусками — проверяй отсюда, когда заказ реально уедет, и нажимай «Готово» после того как провёл документ и оплату вручную.</p>
+    <div id="pendingOzonList"></div>
   </div>
 
   <div class="card">
@@ -221,6 +234,95 @@ function clearLog() {
   logEl.innerHTML = '';
   logLines = 0;
   logCountEl.textContent = 'пусто';
+}
+
+/* ===================== ОЗОН: ЗАКАЗЫ "ОЖИДАЕТ СБОРКИ/ОТГРУЗКИ" (ручной контроль) ===================== */
+
+// Такие заказы отгрузку в МоемСкладе УЖЕ получают (см. processMarketplaceOrder), но без
+// проведения и без платежа — заказ может ещё не уехать, отмениться и т.п. Пользователю
+// нужно самому вернуться к нему позже и провести документ/оплату, когда статус ОЗОН
+// сменится на финальный. Чтобы такие заказы не терялись между запусками (журнал выше —
+// просто текст на экране, он легко потеряется после "Очистить" или закрытия страницы),
+// храним отдельный список в localStorage и рисуем его отдельной карточкой над журналом.
+const PENDING_OZON_KEY = 'ms_pending_ozon_orders';
+
+function loadPendingOzonOrders() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PENDING_OZON_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function savePendingOzonOrders(list) {
+  localStorage.setItem(PENDING_OZON_KEY, JSON.stringify(list));
+}
+
+// Вызывается из processMarketplaceOrder ТОЛЬКО для настоящих (не тестовых) прогонов —
+// в тестовом прогоне документ в МоемСкладе физически не создаётся, и ссылка на него вела
+// бы в никуда, поэтому в список попадают только реальные id настоящих отгрузок.
+function addPendingOzonOrder(entry) {
+  const list = loadPendingOzonOrders();
+  if (list.some(e => e.demandId === entry.demandId)) return; // уже есть — не дублируем
+  list.push(entry);
+  savePendingOzonOrders(list);
+  renderPendingOzonOrders();
+}
+
+function removePendingOzonOrder(demandId) {
+  savePendingOzonOrders(loadPendingOzonOrders().filter(e => e.demandId !== demandId));
+  renderPendingOzonOrders();
+}
+
+function renderPendingOzonOrders() {
+  const list = loadPendingOzonOrders();
+  const countEl = document.getElementById('pendingOzonCount');
+  const listEl = document.getElementById('pendingOzonList');
+  if (countEl) countEl.textContent = list.length ? String(list.length) : 'пусто';
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  if (!list.length) {
+    const emptyMsg = document.createElement('p');
+    emptyMsg.className = 'hint';
+    emptyMsg.style.margin = '0';
+    emptyMsg.textContent = 'Сейчас нет заказов, ожидающих сборки/отгрузки.';
+    listEl.appendChild(emptyMsg);
+    return;
+  }
+  // Новые сверху — их обычно и нужно проверять первыми.
+  for (const entry of [...list].reverse()) {
+    const item = document.createElement('div');
+    item.className = 'pending-item';
+
+    const info = document.createElement('div');
+    const infoB = document.createElement('b');
+    infoB.textContent = entry.header;
+    info.appendChild(infoB);
+    info.appendChild(document.createTextNode(' — ' + entry.counterparty));
+    item.appendChild(info);
+
+    const dateLine = document.createElement('div');
+    dateLine.className = 'hint';
+    dateLine.style.margin = '2px 0 0';
+    dateLine.textContent = 'Отгрузка от ' + entry.date;
+    item.appendChild(dateLine);
+
+    const link = document.createElement('a');
+    link.href = `https://online.moysklad.ru/app/#demand/edit?id=${entry.demandId}`;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'Открыть отгрузку в МоемСкладе →';
+    item.appendChild(link);
+
+    const doneBtn = document.createElement('button');
+    doneBtn.className = 'secondary';
+    doneBtn.textContent = '✓ Готово — проверил(а), документ и оплата проведены';
+    doneBtn.addEventListener('click', () => removePendingOzonOrder(entry.demandId));
+    item.appendChild(doneBtn);
+
+    listEl.appendChild(item);
+  }
 }
 
 /* ===================== ОКРУГЛЕНИЕ "КАК В PYTHON" (round half to even) ===================== */
@@ -1213,6 +1315,13 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
     // как обычную успешную отгрузку, чтобы такие заказы бросались в глаза в журнале и их не
     // забыли провести/оплатить вручную в МоемСкладе, когда заказ реально соберут/отгрузят.
     log(`  ⏳ Отгрузка ОЗОН [${header}] (${cpRaw}) СОЗДАНА, НО НЕ ПРОВЕДЕНА — статус "ожидает сборки/отгрузки". Платёж не создан — вернитесь к заказу, когда он будет собран/отгружен.${drSuffix()}`);
+    // В тестовом прогоне документ физически не создаётся в МоемСкладе (createDemand
+    // возвращает фиктивный id без .id вовсе) — ссылка вела бы в никуда, поэтому в
+    // сохраняемый список попадают только РЕАЛЬНЫЕ отгрузки настоящего прогона.
+    if (!DRY_RUN && demandResult.id) {
+      logLink('     📄 Открыть документ в МоемСкладе →', `https://online.moysklad.ru/app/#demand/edit?id=${demandResult.id}`);
+      addPendingOzonOrder({ header, counterparty: cpRaw, demandId: demandResult.id, date: reportDate });
+    }
     stats.missingPayments++;
     return;
   }
@@ -1853,6 +1962,7 @@ processBtn.addEventListener('click', async () => {
 });
 
 loadConfig();
+renderPendingOzonOrders();
 </script>
 </body>
 </html>
