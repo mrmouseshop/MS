@@ -1214,6 +1214,25 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'vilagran_martiko_130g': 2,
   'martiko_vilagran_soroa_130g': 3,
   'special_and_deleitum_150g': 2,
+  // Сырные/хамонные наборы CV_* — карточка-набор из нескольких одинаковых штук базового
+  // товара (суффикс _x2/_x4 в артикуле — это кол-во штук В НАБОРЕ, а не вес/цена).
+  'cv_brie_kaserei_x4': 4,
+  'cv_camembert_kaserei_x4': 4,
+  'cv_briette_mild_x4': 4,
+  'cv_creamcheese_camembert_spanish_x4': 4,
+  'cv_creamcheese_cheddar_spanish_x4': 4,
+  'cv_brie_field_dairy_x4': 4,
+  'cv_camembert_field_dairy_x4': 4,
+  'cv_geitost_tine_x2': 2,
+  'cv_gudbrandsdalen_tine_x2': 2,
+  'cv_parmesan_993_30mes_x2': 2,
+  'cv_kinara_truffle_x2': 2,
+  'cv_parmesan_myshki_30mes_x2': 2,
+  'cv_gudbrandsdalen_tine_500g_x2': 2,
+  'cv_bestemorost_tine_x2': 2,
+  'cv_laleyenda_trufa_x2': 2,
+  'cv_manchego_dop_unico_18mes_x2': 2,
+  'cv_jamon_rodriguez_serrano_250g_x2': 2,
 };
 
 async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0 }) {
