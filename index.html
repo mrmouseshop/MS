@@ -1276,7 +1276,7 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_jamon_rodriguez_serrano_250g_x2': 2,
 };
 
-async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0 }) {
+async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [] }) {
   const cpRaw = lines[0] || 'OZON';
   const fullDesc = `${header}\n${block.trim()}`;
 
@@ -1322,6 +1322,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
 
   if (!ozonLines.length && !isCancelled) {
     log(`  [!!!] ОЗОН: в заказе [${header}] не нашлась строка "N шт, артикул" — пропускаю, проведите вручную.`);
+    stats.skippedEmptyOrders.push({ header, reason: 'не нашлась строка "N шт, артикул"' });
     return;
   }
 
@@ -1361,6 +1362,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
 
   if (!newItems.length) {
     log(`  [ПРОПУСК] Ни один товар из заказа ОЗОН [${header}] не найден в МоемСкладе — отгрузка не создана.`);
+    stats.skippedEmptyOrders.push({ header, reason: 'ни один артикул не найден в МоемСкладе' });
     return;
   }
 
@@ -1454,7 +1456,7 @@ async function processReport(reportTextRaw) {
   // Сводная статистика по всему запуску — печатается коротким блоком в самом конце
   // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
   // несостыковок/непроведённых платежей вручную.
-  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0 };
+  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [] };
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
@@ -1680,7 +1682,12 @@ async function processReport(reportTextRaw) {
       // это просто хвост из букв. Без этого расширения остаток "от 10 т.р." уходил в pRaw
       // и давал ложное "[!!!] ВНИМАНИЕ: Товар 'от 10 т.р.' не найден!" — списывать тут всё
       // равно нечего, товар не назван.
-      const giftNoteOnlyRegex = /^(?:сырныйпрезент|подарок|подароккзаказу|презент|презенткзаказу)(?:от[а-я]*)?$/;
+      //
+      // Та же пометка иногда пишется с добавкой "на заказ" ПЕРЕД "от" — "Сырный презент на
+      // заказ от 10 т.р." (реальный случай 20.10, заказ 6, без пометки "[-то что дарим]" и
+      // без тире с названием товара дальше). Без этого варианта остаток "на заказ от 10 т.р."
+      // уходил в pRaw и давал ложное "[!!!] ВНИМАНИЕ: Товар 'на заказ от 10 т.р.' не найден!".
+      const giftNoteOnlyRegex = /^(?:сырныйпрезент|подарок|подароккзаказу|презент|презенткзаказу)(?:назаказ)?(?:от[а-я]*)?$/;
       if (giftNoteOnlyRegex.test(justLetters)) continue;
 
       const isGift = /🎁|подарок|презент/.test(lineLower) || /[-–—=]\s*0\s*(?:₽|руб)?\s*$/.test(lineLower);
@@ -1875,6 +1882,14 @@ async function processReport(reportTextRaw) {
     // --- ОТГРУЗКА ---
     if (!itemsSell.length) {
       log(`  [ПРОПУСК] В заказе [${header}] (${name}) не найдено товаров. Отгрузка не создана.`);
+      // "Недозаказ" — часто это не брошенный заказ, а ДОПЛАТА/коррекция по старому заказу
+      // (например "0.1 ДОПЛАТА / Заказ №4 от 17.10 / 1) Парм 60 мес - 0.016 / Итого: 100" —
+      // доплата за перевес кусочка сыра), запись без распознаваемого товара (поэтому
+      // отгрузка и не создаётся — списывать физически нечего), но ДЕНЬГИ по ней всё равно
+      // причитаются и должны быть проведены ВРУЧНУЮ. Раньше это тонуло в общем журнале и
+      // легко забывалось — выносим в итоговую сводку отдельным пунктом, чтобы точно не
+      // потерялось.
+      stats.skippedEmptyOrders.push({ header, reason: `не найдено товаров (контрагент: ${name})` });
     } else if (header.toUpperCase().includes('НЕ ОПЛАЧЕН')) {
       log(`  [ПРОПУСК] Заказ [${header}] (${name}) НЕ ОПЛАЧЕН. Отгрузка отменена.`);
     } else {
@@ -1983,6 +1998,19 @@ async function processReport(reportTextRaw) {
     log(`  ❗ПРОВЕРЬТЕ ЦЕНУ (сводно): ${stats.priceCheckCount} позици(й) с расхождением цены на общую сумму ${(stats.priceCheckDiffKop / 100).toFixed(2)} ₽ — см. отмеченные позиции выше (возможно, найден не тот товар).`);
   } else {
     log(`  [OK] Расхождений цены (отчёт vs МойСклад) за этот запуск не обнаружено.`);
+  }
+  if (stats.skippedEmptyOrders.length > 0) {
+    // "Недозаказы" — ДОПЛАТА/коррекции и прочие записи без распознаваемого товара (см.
+    // комментарий у push() выше) — отгрузка по ним не создаётся, но деньги по ним всё
+    // равно причитаются и должны быть проведены вручную. Перечисляем каждую запись отдельно
+    // (а не только счётчиком), чтобы было сразу видно, КАКИЕ заказы нужно проверить, без
+    // необходимости листать весь журнал заново в их поисках.
+    log(`  ❗ПРОВЕРЬТЕ ВРУЧНУЮ (сводно): ${stats.skippedEmptyOrders.length} запис(ей) без распознанного товара — отгрузка НЕ создана, деньги (если причитаются) проведите вручную:`);
+    for (const { header, reason } of stats.skippedEmptyOrders) {
+      log(`    - [${header}]: ${reason}`);
+    }
+  } else {
+    log(`  [OK] "Недозаказов"/ДОПЛАТ без распознанного товара за этот запуск не обнаружено.`);
   }
   log(`  Списаний (подарков) создано: ${stats.lossDocs}`);
   log('');
