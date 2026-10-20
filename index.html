@@ -446,28 +446,6 @@ const MANUAL_MAP = {
   'набор хамон (палета) серрано espana la barrica': 'Набор Хамон (Палета) Серрано ESPANA la Barrica',
 };
 
-// Некоторые позиции отчёта — это витринный "набор" из НЕСКОЛЬКИХ разных товаров под одной
-// фиксированной ценой (например "Набор "Три Фуэта" Elpozo — 1950 ₽"), а не одна карточка
-// в каталоге. Такого товара "Набор Три Фуэта Elpozo" в МоемСкладе нет — физически со склада
-// нужно списать все перечисленные компоненты набора ПО ИХ НАСТОЯЩИМ каталожным названиям
-// (через тот же findProductMeta, который сам переживёт смену цены в каталоге), а цену,
-// указанную в отчёте за весь набор, разделить РОВНО ПОРОВНУ между компонентами — то есть
-// НЕ использовать текущую каталожную цену каждого компонента (сумма каталожных цен не
-// обязана совпадать с ценой набора и может отличаться от неё произвольно). Ключ — название
-// набора из отчёта (нормализуется ниже: регистр, кавычки, лишние пробелы не важны), значение —
-// фиксированный список каталожных названий компонентов в заданном порядке.
-const BUNDLE_SPLIT_MAP = {
-  'набор три фуэта elpozo': [
-    'Фуэт иберико Elpozo 150гр',
-    'Фуэт трюфель Elpozo 150гр',
-    'Фуэт оригинал Elpozo 170гр',
-  ],
-};
-
-function normalizeBundleName(s) {
-  return s.toLowerCase().replace(/[«»"'„“”]/g, '').replace(/\s+/g, ' ').trim();
-}
-
 // Часть названий в каталоге (скопированных откуда-то с подменой раскладки) на самом деле
 // набрана "смешанным" шрифтом — визуально латинские буквы на деле кириллические омоглифы,
 // например "Rоdriguеz" (тут "о" и "е" — кириллица, выглядит как "Rodriguez", но байтово
@@ -1237,9 +1215,15 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'martiko_vilagran_soroa_130g': 3,
   'special_and_deleitum_150g': 2,
   // Сырные/хамонные наборы CV_* — карточка-набор из нескольких одинаковых штук базового
-  // товара (суффикс _x2/_x4 в артикуле — это кол-во штук В НАБОРЕ, а не вес/цена).
-  'cv_brie_kaserei_x4': 4,
-  'cv_camembert_kaserei_x4': 4,
+  // товара (суффикс _x2/_x3/_x4 в артикуле — это кол-во штук В НАБОРЕ, а не вес/цена).
+  // ВАЖНО: 20.10.26 артикулы Бри/Камамбер Kaserei поменялись с _x4 на _x3 (в наборе стало
+  // 3 шт, а не 4) — старые ключи 'cv_brie_kaserei_x4'/'cv_camembert_kaserei_x4' больше не
+  // встретятся в заказах ОЗОН, их тут больше нет. Пармезан 993 30мес ТОЖЕ перестал быть
+  // набором — его новый артикул 'cv_parmesan_993_30mes' (без суффикса _x2) умышленно
+  // ОТСУТСТВУЕТ в этой карте: для артикулов без записи здесь множитель по умолчанию = 1
+  // (см. ниже `|| 1`), то есть отгружается 1 кусок 250г, как и нужно.
+  'cv_brie_kaserei_x3': 3,
+  'cv_camembert_kaserei_x3': 3,
   'cv_briette_mild_x4': 4,
   'cv_creamcheese_camembert_spanish_x4': 4,
   'cv_creamcheese_cheddar_spanish_x4': 4,
@@ -1247,7 +1231,6 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_camembert_field_dairy_x4': 4,
   'cv_geitost_tine_x2': 2,
   'cv_gudbrandsdalen_tine_x2': 2,
-  'cv_parmesan_993_30mes_x2': 2,
   'cv_kinara_truffle_x2': 2,
   'cv_parmesan_myshki_30mes_x2': 2,
   'cv_gudbrandsdalen_tine_500g_x2': 2,
@@ -1680,52 +1663,6 @@ async function processReport(reportTextRaw) {
       // должна применяться к нему ЕЩЁ РАЗ поверх уже сниженной цены. Ловим тег ДО того, как
       // findProductMeta нормализует название и "[SALE]" потеряется вместе с остальным текстом.
       const alreadyDiscounted = /\[\s*sale\s*\]/i.test(pRaw) || !!itemDiscountMatch;
-
-      // "Набор"-агрегат (см. BUNDLE_SPLIT_MAP выше) — одна строка отчёта физически
-      // раскладывается на НЕСКОЛЬКО разных товаров в отгрузке, а не ищется как одна
-      // карточка. Проверяем ДО обычного findProductMeta(pRaw, ...), иначе он просто не
-      // найдёт несуществующий в каталоге товар "Набор Три Фуэта Elpozo" и строка уйдёт в
-      // "[!!!] Товар не найден!" вместо того, чтобы разделиться на компоненты.
-      const bundleComponents = BUNDLE_SPLIT_MAP[normalizeBundleName(pRaw)];
-      if (bundleComponents) {
-        const bundleTotalPrice = extractTextPrice(content);
-        if (bundleTotalPrice === null) {
-          log(`  [!!!] ВНИМАНИЕ: Набор '${pRaw}' — не нашёл цену набора в строке, разделить между компонентами не могу!`);
-          continue;
-        }
-        const n = bundleComponents.length;
-        const baseShareKop = Math.floor(bundleTotalPrice / n);
-        // Остаток копеек (если цена набора не делится на N без остатка) отдаём последнему
-        // компоненту — так сумма долей компонентов всегда точно равна цене набора из
-        // отчёта, без расхождений с "Итого"/"Выручка" за день из-за округления.
-        const bundleItems = [];
-        let bundleOk = true;
-        bundleComponents.forEach((compName, idx) => {
-          const compData = findProductMeta(compName, weight);
-          if (!compData) {
-            log(`  [!!!] ВНИМАНИЕ: Компонент набора '${compName}' (из состава '${pRaw}') не найден в МоемСкладе!`);
-            bundleOk = false;
-            return;
-          }
-          const shareKop = idx === n - 1 ? (bundleTotalPrice - baseShareKop * (n - 1)) : baseShareKop;
-          const target = isGift
-            ? { quantity: weight, assortment: { meta: compData.meta }, price: compData.buy_price, _name: compData.name }
-            : { quantity: weight, assortment: { meta: compData.meta }, price: shareKop, _name: compData.name, _catalog_price: compData.price, _alreadyDiscounted: alreadyDiscounted };
-          bundleItems.push({ item: target, shareKop, isGift });
-        });
-        if (!bundleOk) continue;
-        for (const { item, shareKop, isGift: itGift } of bundleItems) {
-          if (itGift) {
-            log(`  [🎁 ПОДАРОК НАБОРА] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}) -> В СПИСАНИЕ`);
-            itemsLoss.push(item);
-          } else {
-            log(`  [OK НАБОР] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}, Доля цены набора: ${(shareKop / 100).toFixed(2)} ₽ из ${(bundleTotalPrice / 100).toFixed(2)} ₽ за ${n})`);
-            itemsSell.push(item);
-          }
-          lastItem = item;
-        }
-        continue;
-      }
 
       const productData = findProductMeta(pRaw, weight);
       if (!productData) {
