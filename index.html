@@ -189,7 +189,8 @@ function log(msg) {
 
   let cls = 'l-info';
   if (msg.includes('[OK]')) cls = 'l-ok';
-  else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН')) cls = 'l-warn';
+  else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
+           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || /^\s*- \[.*\]:/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
   else if (msg.includes('🎁') || msg.includes('ПОДАРОК')) cls = 'l-gift';
@@ -486,6 +487,17 @@ function foldHomoglyphs(s) {
   return s.replace(/[аеорсух]/g, ch => HOMOGLYPH_MAP[ch]);
 }
 
+// Явный вес в тексте бывает указан то в граммах, то в килограммах ("~270гр" против "~1 кг") —
+// приводим к граммам, чтобы сравнивать по одной шкале (см. использование ниже, в
+// findProductMeta, где раньше сверка смотрела только на "N гр" с обеих сторон и тихо
+// пропускалась, если у одной стороны вес был в "N кг").
+function extractSizeGrams(s) {
+  const m = s.match(/(\d+(?:[.,]\d+)?)\s*(кг|гр)(?![а-яёА-ЯЁa-zA-Z])/i);
+  if (!m) return null;
+  const value = parseFloat(m[1].replace(',', '.'));
+  return m[2].toLowerCase() === 'кг' ? value * 1000 : value;
+}
+
 function findProductMeta(pRaw, weight) {
   let query = pRaw.toLowerCase().trim();
 
@@ -616,11 +628,17 @@ function findProductMeta(pRaw, weight) {
       // порядку в кэше, даже если вес в её названии не совпадает с весом в запросе —
       // например, отчёт "...Sepi ~900гр" тихо подставлялся как карточка "~300гр".
       // Как и с "мес"/"mesi" выше: если и в запросе, и в названии-кандидате явно указан
-      // вес в граммах, числа обязаны совпасть.
-      const gramRegex = /(\d+)\s*гр(?![а-яёА-ЯЁa-zA-Z])/;
-      const queryGramMatch = query.match(gramRegex);
-      const nameGramMatch = nameLower.match(gramRegex);
-      if (queryGramMatch && nameGramMatch && queryGramMatch[1] !== nameGramMatch[1]) continue;
+      // вес, числа обязаны совпасть. ВАЖНО: вес может быть указан в РАЗНЫХ единицах —
+      // например отчёт "Пармезан 30мес Cantarelli ~270гр" против каталожного "Пармезан
+      // 30мес Cantarelli ~1 кг" (реальный случай 20.10, заказ 6) — это разные по факту
+      // фасовки (270г и 1кг, более чем втрое), но раньше проверка искала только паттерн
+      // "N гр" с ОБЕИХ сторон: у "1 кг" такого паттерна нет ("кг" ≠ "гр"), сравнение тихо
+      // пропускалось, и нечёткий поиск мог молча подставить совсем другую по размеру
+      // карточку (с другой ценой). Приводим обе стороны к граммам (1 кг = 1000 гр) и
+      // сравниваем в одной шкале.
+      const querySizeG = extractSizeGrams(query);
+      const nameSizeG = extractSizeGrams(nameLower);
+      if (querySizeG !== null && nameSizeG !== null && querySizeG !== nameSizeG) continue;
 
       // "Трюфель" — это НЕ вариация оформления, а признак совсем другого товара: набор/сыр
       // "с трюфелем" и такой же набор/сыр БЕЗ трюфеля — разные позиции по разной цене, а не
