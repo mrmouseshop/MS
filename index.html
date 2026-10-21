@@ -190,7 +190,8 @@ function log(msg) {
   let cls = 'l-info';
   if (msg.includes('[OK]')) cls = 'l-ok';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
-           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || /^\s*- \[.*\]:/.test(msg)) cls = 'l-warn';
+           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') ||
+           /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
   else if (msg.includes('🎁') || msg.includes('ПОДАРОК')) cls = 'l-gift';
@@ -498,6 +499,32 @@ function extractSizeGrams(s) {
   return m[2].toLowerCase() === 'кг' ? value * 1000 : value;
 }
 
+// Было ли совпадение товара РОВНО 1-в-1 (без учёта регистра/лишних пробелов/тега [SALE]),
+// или нечёткий поиск подобрал что-то похожее, но по факту другое название? Раньше в журнал
+// попадали ОБА названия ("найден как '...'"), но визуально строка ничем не отличалась от
+// честного точного совпадения — отличие было видно только если вручную сравнить текст в
+// кавычках. Именно поэтому реальный случай "Пармезан 30мес Cantarelli ~270гр", подставленный
+// как другая по факту карточка "~1 кг" (другой вес, другая цена), прошёл незамеченным в
+// журнале — его увидели только случайно, разглядывая сплошной текст. Эта проверка используется
+// ниже, чтобы ЛЮБОЕ нечёткое совпадение (а не только то, что попутно поймала проверка цены)
+// явно помечалось отдельным тегом в журнале и попадало в сводку "ПРОВЕРЬТЕ НАЗВАНИЕ".
+function namesMatchExactly(reportText, catalogName) {
+  // Сворачиваем омоглифы (как и сам нечёткий поиск выше) и убираем чисто косметический "мусор"
+  // (висячее тире/точку на конце названия, двойные пробелы) — иначе, например, "Prima Donna
+  // Forte" против каталожного "Рrimа Dоnnа Fоrtе" (кириллические омоглифы) или "GranForma ~1кг"
+  // против "GranForma ~1кг -" (висячее тире в каталоге) помечались бы "ПРОВЕРЬТЕ НАЗВАНИЕ"
+  // КАЖДЫЙ раз заново — это не ошибка подбора, а чисто текстовый артефакт, который сам поиск
+  // уже и так считает одним и тем же товаром. Шум от таких "вечных" срабатываний только прятал
+  // бы действительно новые и непроверенные подстановки (как Пармезан ~270гр/~1кг).
+  const norm = s => foldHomoglyphs(s.toLowerCase())
+    .replace(/\[\s*sale\s*\]/gi, '')
+    .replace(/[«»"'„“”]/g, '')
+    .replace(/[-–—.,]+\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return norm(reportText) === norm(catalogName);
+}
+
 function findProductMeta(pRaw, weight) {
   let query = pRaw.toLowerCase().trim();
 
@@ -541,7 +568,12 @@ function findProductMeta(pRaw, weight) {
         const data = PRODUCTS_CACHE[fullName];
         const msNameClean = fullName.trim().toLowerCase().replace(/ä/g, 'a');
         if (msNameClean === correctNameClean) {
-          return { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price || 0 };
+          // viaManualMap: это заранее вручную проверенное человеком соответствие (а не догадка
+          // нечёткого поиска по словам) — namesMatchExactly ниже не должна помечать такие
+          // совпадения как "ПРОВЕРЬТЕ НАЗВАНИЕ", иначе один и тот же, уже проверенный alias
+          // (например "кабра с паприкой vega" -> длинное каталожное название) подсвечивался бы
+          // КАЖДЫЙ раз заново, пряча в шуме действительно новые и непроверенные подстановки.
+          return { name: fullName, meta: data.meta, price: data.price, buy_price: data.buy_price || 0, viaManualMap: true };
         }
       }
       log(`  [DEBUG] ВНИМАНИЕ: Словарь понял, что это '${correctName}', но не нашел точно такого названия в МС!`);
@@ -1294,7 +1326,7 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_jamon_rodriguez_serrano_250g_x2': 2,
 };
 
-async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [] }) {
+async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] }) {
   const cpRaw = lines[0] || 'OZON';
   const fullDesc = `${header}\n${block.trim()}`;
 
@@ -1474,7 +1506,7 @@ async function processReport(reportTextRaw) {
   // Сводная статистика по всему запуску — печатается коротким блоком в самом конце
   // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
   // несостыковок/непроведённых платежей вручную.
-  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [] };
+  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] };
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
@@ -1765,18 +1797,20 @@ async function processReport(reportTextRaw) {
             return;
           }
           const shareKop = idx === n - 1 ? (bundleTotalPrice - baseShareKop * (n - 1)) : baseShareKop;
+          const compExact = compData.viaManualMap || namesMatchExactly(compName, compData.name);
           const target = isGift
             ? { quantity: weight, assortment: { meta: compData.meta }, price: compData.buy_price, _name: compData.name }
             : { quantity: weight, assortment: { meta: compData.meta }, price: shareKop, _name: compData.name, _catalog_price: compData.price, _alreadyDiscounted: alreadyDiscounted };
-          bundleItems.push({ item: target, shareKop, isGift });
+          bundleItems.push({ item: target, shareKop, isGift, compExact });
         });
         if (!bundleOk) continue;
-        for (const { item, shareKop, isGift: itGift } of bundleItems) {
+        for (const { item, shareKop, isGift: itGift, compExact } of bundleItems) {
           if (itGift) {
             log(`  [🎁 ПОДАРОК НАБОРА] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}) -> В СПИСАНИЕ`);
             itemsLoss.push(item);
           } else {
-            log(`  [OK НАБОР] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}, Доля цены набора: ${(shareKop / 100).toFixed(2)} ₽ из ${(bundleTotalPrice / 100).toFixed(2)} ₽ за ${n})`);
+            if (!compExact) stats.nameMismatches.push({ reportName: item._name, catalogName: item._name });
+            log(`  [${compExact ? 'OK НАБОР' : 'ПРОВЕРЬТЕ НАЗВАНИЕ НАБОРА'}] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}, Доля цены набора: ${(shareKop / 100).toFixed(2)} ₽ из ${(bundleTotalPrice / 100).toFixed(2)} ₽ за ${n})`);
             itemsSell.push(item);
           }
           lastItem = item;
@@ -1789,9 +1823,11 @@ async function processReport(reportTextRaw) {
         log(`  [!!!] ВНИМАНИЕ: Товар '${pRaw}' не найден!`);
         continue;
       }
+      const nameExactMatch = productData.viaManualMap || namesMatchExactly(pRaw, productData.name);
+      if (!nameExactMatch) stats.nameMismatches.push({ reportName: pRaw, catalogName: productData.name });
 
       if (isGift) {
-        log(`  [🎁 ПОДАРОК] Товар '${pRaw}' (Кол-во: ${weight}) -> В СПИСАНИЕ`);
+        log(`  [${nameExactMatch ? '🎁 ПОДАРОК' : 'ПРОВЕРЬТЕ НАЗВАНИЕ (ПОДАРОК)'}] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}) -> В СПИСАНИЕ`);
         const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: productData.buy_price, _name: productData.name };
         itemsLoss.push(newItem);
         lastItem = newItem;
@@ -1808,7 +1844,7 @@ async function processReport(reportTextRaw) {
             sellPrice = textPrice;
           }
         }
-        log(`  [OK] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [уже со скидкой — не участвует в автоскидке заказа]' : ''}`);
+        log(`  [${nameExactMatch ? 'OK' : 'ПРОВЕРЬТЕ НАЗВАНИЕ'}] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [уже со скидкой — не участвует в автоскидке заказа]' : ''}`);
         const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: sellPrice, _name: productData.name, _catalog_price: productData.price, _alreadyDiscounted: alreadyDiscounted };
         itemsSell.push(newItem);
         lastItem = newItem;
@@ -2029,6 +2065,22 @@ async function processReport(reportTextRaw) {
     }
   } else {
     log(`  [OK] "Недозаказов"/ДОПЛАТ без распознанного товара за этот запуск не обнаружено.`);
+  }
+  if (stats.nameMismatches.length > 0) {
+    // Товар НАШЁЛСЯ (в отличие от "[!!!] не найден" выше), но название в каталоге совпало с
+    // отчётом НЕ 1-в-1 (нечёткий поиск подобрал что-то похожее) — реальный случай: отчёт
+    // "Пармезан 30мес Cantarelli ~270гр" тихо подставлялся как каталожная карточка "~1 кг"
+    // (фактически другая по весу и цене позиция), и расхождение названия само по себе никак
+    // не показывалось — заметили только случайно, разглядывая сплошной текст журнала. Такое
+    // совпадение может быть безобидным (сокращение, другой порядок слов, омоглиф), а может
+    // быть ошибкой подбора — поэтому выносим ВСЕ такие случаи отдельным списком в сводку, а не
+    // только те, что попутно поймала проверка цены/веса.
+    log(`  ❗ПРОВЕРЬТЕ НАЗВАНИЕ (сводно): ${stats.nameMismatches.length} позици(й) найдены НЕ 1-в-1 с текстом отчёта — сверьте, тот ли товар подобран:`);
+    for (const { reportName, catalogName } of stats.nameMismatches) {
+      log(`    - [${reportName}] -> [${catalogName}]`);
+    }
+  } else {
+    log(`  [OK] Все найденные товары совпали с текстом отчёта 1-в-1.`);
   }
   log(`  Списаний (подарков) создано: ${stats.lossDocs}`);
   log('');
