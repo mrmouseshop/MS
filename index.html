@@ -446,6 +446,16 @@ const MANUAL_MAP = {
   'олд амстердам (коровий)': 'Олд Амстердам (коровий)',
   'Олд Амстердам коровий (резерв)': 'Олд Амстердам коровий (резерв)',
   'набор хамон (палета) серрано espana la barrica': 'Набор Хамон (Палета) Серрано ESPANA la Barrica',
+  // Old Irish — в каталоге ОДНА весовая карточка-ассорти на все вкусы (подтверждено 23.10),
+  // в отчёте менеджеры пишут конкретный вкус. Ключи без апострофа ("luck", а не "luck o'"),
+  // чтобы не зависеть от того, прямой он или типографский.
+  'old irish luck': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish oak smoked': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish porter': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish red wine': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish whiskey': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish shraracha': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
+  'old irish sriracha': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
 };
 
 // Некоторые позиции отчёта — это витринный "набор" из НЕСКОЛЬКИХ разных товаров под одной
@@ -563,10 +573,14 @@ function findProductMeta(pRaw, weight) {
   for (const key in MANUAL_MAP) {
     if (queryClean.includes(key)) {
       const correctName = MANUAL_MAP[key];
-      const correctNameClean = correctName.toLowerCase().replace(/ä/g, 'a');
+      // Сравнение с карточкой каталога — без учёта лишних/двойных пробелов и вида апострофа
+      // (’ ‘ ` против '): иначе запись словаря молча "промахивалась" из-за невидимой мелочи
+      // в названии карточки и поиск уходил в нечёткий режим.
+      const mapNorm = s => s.trim().toLowerCase().replace(/ä/g, 'a').replace(/[’‘`]/g, "'").replace(/\s+/g, ' ');
+      const correctNameClean = mapNorm(correctName);
       for (const fullName in PRODUCTS_CACHE) {
         const data = PRODUCTS_CACHE[fullName];
-        const msNameClean = fullName.trim().toLowerCase().replace(/ä/g, 'a');
+        const msNameClean = mapNorm(fullName);
         if (msNameClean === correctNameClean) {
           // viaManualMap: это заранее вручную проверенное человеком соответствие (а не догадка
           // нечёткого поиска по словам) — namesMatchExactly ниже не должна помечать такие
@@ -737,6 +751,11 @@ function detectDiscountPercent(blockText) {
   m = textLower.match(/скидк[а-яё]*\s*:?\s*(\d{1,2})\s*%/);
   if (m) return parseInt(m[1], 10);
 
+  // Процентный купон ("Купон 10%") — рублёвый купон ("Купон 100 рублей") ловится отдельно,
+  // в detectFlatDiscountRub.
+  m = textLower.match(/купон[а-яё]*[^\d\n]{0,20}?(\d{1,2})\s*%/);
+  if (m) return parseInt(m[1], 10);
+
   // ВАЖНО: минус перед процентом не всегда обычный дефис "-" (U+002D) — в промокодах
   // (например, скопированных из другого приложения) он может оказаться "математическим"
   // знаком минус "−" (U+2212), который выглядит идентично, но не совпадает с обычным
@@ -766,6 +785,21 @@ function detectFlatDiscountRub(blockText) {
     const m = line.match(/^-\s*(\d+(?:[.,]\d+)?)\s*(?:р\.?|руб\.?|₽)?\s*$/i);
     if (m) {
       totalRub += parseFloat(m[1].replace(',', '.'));
+      found = true;
+      continue;
+    }
+    // Купон на фиксированную сумму отдельной строкой — "Купон 100 рублей", "Купон: 100₽",
+    // "Купон −100р" (реальный случай 23.10, заказ 4). Раньше такая строка вообще ничего не
+    // делала: из списка позиций она отсекалась (слово "купон" в стоп-списке), а как скидка
+    // не распознавалась — Итого в отчёте уже было уменьшено на 100₽, а сумма позиций в
+    // отгрузке и платёж — нет (переплата в МоемСкладе на сумму купона + ложная
+    // "НЕСОСТЫКОВКА" почти на всю сумму купона). Требуем явную рублёвую единицу после числа,
+    // чтобы не спутать с процентным купоном ("Купон 10%" — см. detectDiscountPercent).
+    // (\b тут не годится — в JS он "видит" только латиницу, поэтому границы кириллических
+    // слов проверяем явным lookahead.)
+    const c = line.match(/^купон[а-яё]*(?![а-яё])[^\d%]{0,20}?(\d+(?:[.,]\d+)?)\s*(?:р(?![а-яё])\.?|руб[а-яё]*\.?|₽)(?!\s*\/)/i);
+    if (c) {
+      totalRub += parseFloat(c[1].replace(',', '.'));
       found = true;
     }
   }
@@ -1910,7 +1944,11 @@ async function processReport(reportTextRaw) {
         // "на бумаге".
         const flatDiscountRub = detectFlatDiscountRub(block);
         if (flatDiscountRub) {
-          const rawTotalRub = itemsSell.reduce((s, it) => s + it.quantity * it.price, 0) / 100;
+          // Процент считаем ТОЛЬКО от суммы позиций, к которым скидка реально применится
+          // (без [SALE]/исключений) — иначе при наличии в заказе исключённого товара
+          // фактически списывалась бы лишь часть плоской суммы (например, из купона на 100₽
+          // при одной [SALE]-позиции на 3000₽ из 36000₽ уходило бы только ~92₽).
+          const rawTotalRub = itemsSell.filter(it => !isDiscountExcluded(it)).reduce((s, it) => s + it.quantity * it.price, 0) / 100;
           if (rawTotalRub > 0) {
             discountPercent = Math.round((flatDiscountRub / rawTotalRub) * 10000) / 100; // до 2 знаков после запятой
             discountLabel = `${flatDiscountRub}₽ (~${discountPercent}%)`;
