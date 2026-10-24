@@ -348,7 +348,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '24.10.2026 (купоны, словарь Old Irish, правило фуагра/бриет)';
+const APP_VERSION = '24.10.2026-2 (проверка платежа при повторном прогоне)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1428,6 +1428,13 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
 
   if (await demandAlreadyExists(cId, reportDate, fullDesc)) {
     log(`  [ПРОПУСК] Отгрузка ОЗОН [${header}] уже есть в МоемСкладе — дубль не создаю.`);
+    // Если прошлый прогон оборвался МЕЖДУ созданием отгрузки и платежа (например "Failed to
+    // fetch" — пропала связь), повторный прогон раньше молча пропускал заказ целиком, и платёж
+    // так и не появлялся. Теперь проверяем и платёж тоже (для отменённых/ожидающих он не нужен).
+    if (!isCancelled && !isPendingStatus && !(await paymentAlreadyExists(cId, reportDate, fullDesc))) {
+      log(`  [ПЛАТЁЖ НЕ СОЗДАН] Отгрузка ОЗОН [${header}] уже есть, а входящего платежа к ней нет (похоже, прошлый прогон прервался) — создайте платёж вручную.`);
+      stats.missingPayments++;
+    }
     return;
   }
 
@@ -2003,6 +2010,12 @@ async function processReport(reportTextRaw) {
       if (cId) {
         if (await demandAlreadyExists(cId, reportDate, fullDesc)) {
           log(`  [ПРОПУСК] Отгрузка [${header}] (${name}) уже есть в МоемСкладе (похоже, отчёт уже обрабатывался) — дубль не создаю.`);
+          // См. такую же проверку в processMarketplaceOrder: отгрузка есть, а платёж мог не
+          // успеть создаться, если прошлый прогон оборвался посередине заказа.
+          if (!(await paymentAlreadyExists(cId, reportDate, fullDesc))) {
+            log(`  [ПЛАТЁЖ НЕ СОЗДАН] Отгрузка [${header}] (${name}) уже есть, а входящего платежа к ней нет (похоже, прошлый прогон прервался) — создайте платёж вручную.`);
+            stats.missingPayments++;
+          }
         } else {
           const demandResult = await createDemand(cId, itemsSell, reportDate, fullDesc);
           if (demandResult) {
@@ -2221,6 +2234,7 @@ processBtn.addEventListener('click', async () => {
     }
   } catch (err) {
     log('  [!!!] КРИТИЧЕСКАЯ ОШИБКА: ' + (err && err.message ? err.message : String(err)));
+    log('  [!!!] Обработка прервана на середине. Обычно это сбой связи — просто нажмите «Провести» ещё раз: уже созданные отгрузки и платежи будут пропущены как дубли, а заказ, на котором оборвалось, проверится заново (в том числе — есть ли у него платёж).');
     statusEl.textContent = '✗ Обработка прервана из-за ошибки — см. журнал.';
   } finally {
     DRY_RUN = false;
