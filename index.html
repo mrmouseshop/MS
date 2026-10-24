@@ -346,12 +346,17 @@ function pyRound(x, ndigits) {
 
 /* ===================== КЭШ ТОВАРОВ ===================== */
 
+// Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
+// какая версия файла реально работала (если вкладка не обновлена или файл откатился).
+const APP_VERSION = '24.10.2026 (купоны, словарь Old Irish, правило фуагра/бриет)';
+
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
 
 const DISCOUNT_EXCLUDE_KEYWORDS = []; // ручной список сверх основного правила (по умолчанию пуст)
 
 async function loadProducts() {
+  log(`Версия программы: ${APP_VERSION}`);
   log('Загружаю базу товаров из МоегоСклада...');
   const resp = await fetch(apiUrl('/entity/product?limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
@@ -560,12 +565,16 @@ function findProductMeta(pRaw, weight) {
   // не только для хамона.
   query = query.replace(/(?<![а-яёa-z])нога(?![а-яёa-z])/gi, ' ').replace(/\s+/g, ' ').trim();
 
+  // Встроенные правила "любая фуагра 150г/130г -> карточка-ассорти", "любой бриет -> ассорти"
+  // — это такие же заранее проверенные соответствия, как MANUAL_MAP, поэтому найденная по ним
+  // карточка помечается viaManualMap (см. конец функции) и не подсвечивается "ПРОВЕРЬТЕ НАЗВАНИЕ".
+  let ruleRewritten = false;
   if (query.includes('фуагра') && query.includes('150')) {
-    query = 'фуагра ассорти 150гр';
+    query = 'фуагра ассорти 150гр'; ruleRewritten = true;
   } else if (query.includes('фуагра') && (query.includes('130') || query.includes('130g'))) {
-    query = 'фуагра ассорти 130гр';
+    query = 'фуагра ассорти 130гр'; ruleRewritten = true;
   } else if (query.includes('бриет') || query.includes('briette')) {
-    query = 'бриет briette (асс.) 125гр';
+    query = 'бриет briette (асс.) 125гр'; ruleRewritten = true;
   }
 
   const queryClean = query.replace(/ä/g, 'a');
@@ -721,6 +730,10 @@ function findProductMeta(pRaw, weight) {
       }
     }
   }
+
+  // Найдено по встроенному правилу (фуагра/бриет) и карточка совпала с целевым названием
+  // правила 1-в-1 — это проверенное соответствие, а не догадка нечёткого поиска.
+  if (best && ruleRewritten && namesMatchExactly(query, best.name)) best.viaManualMap = true;
 
   return best;
 }
