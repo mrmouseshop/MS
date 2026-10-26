@@ -348,7 +348,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '24.10.2026-2 (проверка платежа при повторном прогоне)';
+const APP_VERSION = '26.10.2026 (скидка на позицию отдельной строкой)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -740,6 +740,16 @@ function findProductMeta(pRaw, weight) {
 
 /* ===================== СКИДКИ ===================== */
 
+// Персональная скидка на ОДНУ позицию отдельной строкой сразу под ней (как "Куски: ..."),
+// с готовой итоговой ценой после стрелки — например "Скидка −31.23% (−425 ₽): менеджер →
+// 935 ₽" (реальный случай 25.10, заказ 0.1). Возвращает итог позиции в рублях или null.
+// Стрелка (→, ->, =>) обязательна — по ней строка отличается от общей скидки на заказ
+// ("Скидка 10% = −500₽"), которая к одной позиции не относится.
+function parsePerItemDiscountLine(line) {
+  const m = line.trim().match(/^(?:скидк|уценк)[а-яё]*[^\n]*?(?:→|->|=>)\s*(\d+(?:[.,]\d+)?)\s*(?:₽|руб[а-яё]*\.?|р\.?)?\s*$/i);
+  return m ? parseFloat(m[1].replace(',', '.')) : null;
+}
+
 function detectDiscountPercent(blockText) {
   // Строка описания ТОВАРА иногда содержит СВОЙ собственный процент скидки, привязанный
   // именно к этой позиции — например "(4.14) * 295₽/100гр = 12213 ₽ [одним куском] - 15%
@@ -752,7 +762,7 @@ function detectDiscountPercent(blockText) {
   // отдельных строках вида "Промокод: ...", "Скидка 15%", "(−5%) = −785₽" и т.п. Сама
   // точечная скидка конкретной позиции обрабатывается отдельно, при разборе её строки.
   const isItemLikeLine = (line) => /^\d+[)\.]\s+/.test(line) || /[*×]\s*\d+(?:[.,]\d+)?\s*(?:₽|руб)?\s*\/\s*100\s*г/i.test(line);
-  const nonItemText = blockText.split('\n').filter(l => !isItemLikeLine(l.trim())).join('\n');
+  const nonItemText = blockText.split('\n').filter(l => !isItemLikeLine(l.trim()) && parsePerItemDiscountLine(l) === null).join('\n');
   const textLower = nonItemText.toLowerCase();
 
   let m = textLower.match(/(\d{1,2})\s*%\s*ск/);
@@ -1631,8 +1641,37 @@ async function processReport(reportTextRaw) {
     // отдельной функцией detectDiscountPercent, это чисто лишнее предупреждение в логе.
     const percentOnlyLineRegex = /^\(?\s*[-−]\s*\d{1,2}\s*%\s*\)?\s*=\s*[-−]?\s*\d+(?:[.,]\d+)?\s*(?:₽|руб)?\s*$/;
 
+    // Позиции (на продажу), созданные из ПОСЛЕДНЕЙ строки товара, и признак того, что мы всё
+    // ещё "под" этой строкой (между ней и следующей строкой допускаются только "Куски: ...")
+    // — нужно для персональной скидки на позицию отдельной строкой (parsePerItemDiscountLine).
+    let lastLineSellItems = [];
+    let underItemLine = false;
+
     for (const line of lines) {
       const lineLower = line.toLowerCase();
+      const perItemFinalRub = parsePerItemDiscountLine(line);
+      if (/^\d+[)\.]\s+/.test(line)) {
+        underItemLine = true;
+        lastLineSellItems = [];
+      } else if (perItemFinalRub !== null) {
+        if (underItemLine && lastLineSellItems.length) {
+          const curKop = lastLineSellItems.reduce((s, it) => s + it.quantity * it.price, 0);
+          const finalKop = perItemFinalRub * 100;
+          if (curKop > 0) {
+            const k = finalKop / curKop;
+            for (const it of lastLineSellItems) {
+              it.price = pyRound(it.price * k);
+              it._alreadyDiscounted = true; // общая скидка заказа на неё уже не накладывается
+            }
+            log(`  [СКИДКА НА ПОЗИЦИЮ] ${lastLineSellItems.map(it => it._name).join(', ')}: ${(curKop / 100).toFixed(2)} ₽ -> ${perItemFinalRub.toFixed(2)} ₽ (строка '${line.trim()}')`);
+          }
+        } else {
+          log(`  [ПРЕДУПРЕЖДЕНИЕ] Строка скидки '${line.trim()}' не удалось привязать к позиции (перед ней нет товара на продажу) — проверьте вручную.`);
+        }
+        continue;
+      } else if (!/^куск/i.test(line.trim())) {
+        underItemLine = false;
+      }
       if (percentOnlyLineRegex.test(line.trim())) continue;
       // Та же строка-статус с пометкой в скобках, что уже пропускается выше при поиске
       // имени клиента (см. STATUS_LINE_REGEX и комментарий там) — без этой проверки ЗДЕСЬ
@@ -1866,6 +1905,7 @@ async function processReport(reportTextRaw) {
             if (!compExact) stats.nameMismatches.push({ reportName: item._name, catalogName: item._name });
             log(`  [${compExact ? 'OK НАБОР' : 'ПРОВЕРЬТЕ НАЗВАНИЕ НАБОРА'}] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}, Доля цены набора: ${(shareKop / 100).toFixed(2)} ₽ из ${(bundleTotalPrice / 100).toFixed(2)} ₽ за ${n})`);
             itemsSell.push(item);
+            lastLineSellItems.push(item);
           }
           lastItem = item;
         }
@@ -1901,6 +1941,7 @@ async function processReport(reportTextRaw) {
         log(`  [${nameExactMatch ? 'OK' : 'ПРОВЕРЬТЕ НАЗВАНИЕ'}] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [уже со скидкой — не участвует в автоскидке заказа]' : ''}`);
         const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: sellPrice, _name: productData.name, _catalog_price: productData.price, _alreadyDiscounted: alreadyDiscounted };
         itemsSell.push(newItem);
+        lastLineSellItems.push(newItem);
         lastItem = newItem;
       }
     }
