@@ -348,7 +348,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '26.10.2026 (скидка на позицию отдельной строкой)';
+const APP_VERSION = '28.10.2026 (имена контрагентов через |, фуагра Gourmet)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -454,6 +454,7 @@ const MANUAL_MAP = {
   // Old Irish — в каталоге ОДНА весовая карточка-ассорти на все вкусы (подтверждено 23.10),
   // в отчёте менеджеры пишут конкретный вкус. Ключи без апострофа ("luck", а не "luck o'"),
   // чтобы не зависеть от того, прямой он или типографский.
+  'фуагра gourmet finest cuisine': 'Фуагра 200гр жб',
   'old irish luck': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
   'old irish oak smoked': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
   'old irish porter': 'Old Irish (Ассорти вес) Porter Beer / OAK Smoked / Red Wine / Shraracha / Whiskey / Luck o’ Irish',
@@ -916,6 +917,44 @@ function findPhone(text) {
   return '';
 }
 
+function normCpName(s) {
+  return (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function counterpartyNameParts(fullName) {
+  return (fullName || '').split('|').map(normCpName).filter(Boolean);
+}
+
+// Контрагент нашёлся по ТЕЛЕФОНУ, но в отчёте он записан под другим именем (например в
+// МоемСкладе "Виктория ави", а в отчёте "Kris Taada т" — один номер на двоих в семье, или
+// клиент сменил ник). Дописываем новое имя через " | " ("Виктория ави | Kris Taada т"), чтобы
+// по карточке было видно все имена, под которыми заказывали с этого номера. Если такое имя
+// уже есть среди частей — ничего не меняем. Ошибка обновления НЕ прерывает обработку отчёта.
+async function appendCounterpartyAlias(row, reportName) {
+  const alias = (reportName || '').replace(/\s+/g, ' ').trim();
+  if (!alias || !row || !row.id) return;
+  if (counterpartyNameParts(row.name).includes(normCpName(alias))) return;
+  const newName = `${(row.name || '').trim()} | ${alias}`;
+  if (newName.length > 255) {
+    log(`  [ПРЕДУПРЕЖДЕНИЕ] Имя контрагента '${row.name}' слишком длинное, чтобы дописать '${alias}' — оставляю как есть.`);
+    return;
+  }
+  if (DRY_RUN) {
+    log(`  [Контрагент] Имя будет дополнено: '${row.name}' -> '${newName}'${drSuffix()}`);
+    return;
+  }
+  try {
+    const resp = await fetch(apiUrl('/entity/counterparty/' + row.id), { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ name: newName }) });
+    if (resp.ok) {
+      log(`  [Контрагент] Имя дополнено: '${row.name}' -> '${newName}'`);
+      row.name = newName;
+    } else {
+      log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось дописать имя контрагента '${row.name}' (код ${resp.status}) — допишите вручную: '${newName}'.`);
+    }
+  } catch (e) {
+    log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось дописать имя контрагента '${row.name}' (${e && e.message ? e.message : e}) — возможно, прокси не пропускает изменение (PUT). Допишите вручную: '${newName}'.`);
+  }
+}
+
 async function getOrCreateCounterparty(name, phone) {
   const cleanPhone = phone ? phone.replace(/\D/g, '') : '';
 
@@ -927,6 +966,7 @@ async function getOrCreateCounterparty(name, phone) {
       const rows = data.rows || [];
       if (rows.length) {
         log(`  [Контрагент] Найден по ТЕЛЕФОНУ: ${rows[0].name} (ID: ${rows[0].id})`);
+        await appendCounterpartyAlias(rows[0], name);
         return rows[0].id;
       }
     }
@@ -936,7 +976,9 @@ async function getOrCreateCounterparty(name, phone) {
   if (resp.ok) {
     const data = await resp.json();
     for (const row of (data.rows || [])) {
-      if (row.name.toLowerCase() === name.toLowerCase()) {
+      // Имя контрагента может быть "склеенным" из нескольких ("Виктория ави | Kris Taada т" —
+      // см. appendCounterpartyAlias) — совпадение с ЛЮБОЙ частью тоже считается точным.
+      if (counterpartyNameParts(row.name).includes(normCpName(name))) {
         log(`  [Контрагент] Найден по точному ИМЕНИ: ${row.name}`);
         return row.id;
       }
