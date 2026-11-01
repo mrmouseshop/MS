@@ -349,7 +349,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '01.11.2026 ([ПРОПУСК] красным, ОЗОН без веса, хвост подарка)';
+const APP_VERSION = '01.11.2026-2 (ОЗОН «ожидает сборки» — отдельной строкой в итогах)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1554,7 +1554,9 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
       logLink('     📄 Открыть документ в МоемСкладе →', `https://online.moysklad.ru/app/#demand/edit?id=${demandResult.id}`);
       addPendingOzonOrder({ header, counterparty: cpRaw, demandId: demandResult.id, date: reportDate });
     }
-    stats.missingPayments++;
+    // Платёж здесь не создан НАМЕРЕННО (заказ ещё не собран) — считаем отдельно, а не в
+    // "ПЛАТЁЖ НЕ СОЗДАН ... создайте вручную": создавать его сейчас как раз не нужно.
+    stats.pendingOzon = (stats.pendingOzon || 0) + 1;
     return;
   }
 
@@ -2208,6 +2210,9 @@ async function processReport(reportTextRaw) {
     log(`  ПЛАТЁЖ НЕ СОЗДАН (сводно): ${stats.missingPayments} заказ(ов) без входящего платежа — создайте вручную в МоемСкладе.`);
   } else {
     log(`  [OK] Все входящие платежи созданы автоматически.`);
+  }
+  if (stats.pendingOzon > 0) {
+    log(`  ⏳ ОЖИДАЮТ СБОРКИ (сводно): ${stats.pendingOzon} заказ(ов) ОЗОН — отгрузка заведена непроведённой, платёж НЕ нужен до сборки. Проведите отгрузку и создайте платёж, когда заказ соберут.`);
   }
   if (stats.priceCheckCount > 0) {
     // Расхождение цены "в отчёте" vs "в МоемСкладе" иногда означает не опечатку менеджера, а
