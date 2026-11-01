@@ -189,6 +189,8 @@ function log(msg) {
 
   let cls = 'l-info';
   if (msg.includes('[OK]')) cls = 'l-ok';
+  // [ПРОПУСК] — по просьбе пользователя всегда красным (раньше был серым l-skip и терялся в журнале).
+  else if (msg.includes('[ПРОПУСК]')) cls = 'l-error';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
            msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') ||
            /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
@@ -200,7 +202,6 @@ function log(msg) {
   // чтобы такая отгрузка визуально не сливалась с обычной успешно проведённой (l-success) —
   // на неё нужно обратить внимание и вернуться к ней в МоемСкладе, когда заказ будет собран.
   else if (msg.includes('⏳')) cls = 'l-pending';
-  else if (msg.includes('[ПРОПУСК]')) cls = 'l-skip';
   else if (msg.trim().startsWith('=>')) cls = 'l-success';
   else if (!msg.startsWith(' ') && !msg.startsWith('Дата отгрузок')) cls = 'l-header';
 
@@ -348,7 +349,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '28.10.2026 (имена контрагентов через |, фуагра Gourmet)';
+const APP_VERSION = '01.11.2026 ([ПРОПУСК] красным, ОЗОН без веса, хвост подарка)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1461,11 +1462,16 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
   // количество (это для штучных, не весовых товаров).
   const ozonLines = [];
   for (const line of lines) {
-    const m = line.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*([^,]+?)\s*(?:,\s*(\d+(?:[.,]\d+)?)\s*)?$/i);
+    // Третье поле (вес) может быть оставлено ПУСТЫМ — "1 шт, CV_Frico_Chevrette, " (реальный
+    // случай 31.10: заказ ещё "Ожидает сборки", кусок не взвешен). Раньше из-за висячей запятой
+    // строка не распознавалась вовсе и весь заказ пропускался. Теперь запятая без числа = вес
+    // не указан (weightMissing), а что с этим делать — решаем ниже по статусу заказа.
+    const m = line.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*([^,]+?)\s*(,\s*(\d+(?:[.,]\d+)?)?\s*)?$/i);
     if (m) {
       const qty = parseFloat(m[1].replace(',', '.'));
-      const weight = m[3] !== undefined ? parseFloat(m[3].replace(',', '.')) : null;
-      ozonLines.push({ qty: weight !== null ? weight : qty, article: m[2].trim() });
+      const weight = m[4] !== undefined ? parseFloat(m[4].replace(',', '.')) : null;
+      const weightMissing = m[3] !== undefined && m[4] === undefined;
+      ozonLines.push({ qty: weight !== null ? weight : qty, article: m[2].trim(), weightMissing });
     }
   }
 
@@ -1501,11 +1507,19 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
   }
 
   const newItems = [];
-  for (const { qty, article } of ozonLines) {
+  for (const { qty, article, weightMissing } of ozonLines) {
     const productData = findProductByArticle(article);
     if (!productData) {
       log(`  [!!!] ВНИМАНИЕ: ОЗОН-товар с артикулом '${article}' не найден в МоемСкладе! Заказ [${header}] — проведите вручную.`);
       continue;
+    }
+    if (weightMissing) {
+      if (!isPendingStatus) {
+        // Заказ уже собран/доставляется, а вес так и не вписан — сколько списывать, неизвестно.
+        log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' не указан вес куска — позицию не отгружаю, проведите вручную.`);
+        continue;
+      }
+      log(`  [ПРЕДУПРЕЖДЕНИЕ] В заказе ОЗОН [${header}] у '${article}' ещё не указан вес (заказ не собран) — в черновик отгрузки поставлено ${qty} шт, поправьте количество, когда кусок взвесят.`);
     }
     const qtyMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()] || 1;
     const shipQty = qty * qtyMultiplier;
@@ -1884,6 +1898,10 @@ async function processReport(reportTextRaw) {
       // короткий, нечёткий поиск обычно всё равно угадывает товар, но это работает "на
       // удачу" — при более длинном/похожем названии лишние слова могут увести точность
       // ниже порога и дать ложное "Товар не найден". Добавляем оба варианта симметрично.
+      // У подарка всё, что после " — ", — пояснение, а не название: "Филадельфия с лососем
+      // 175гр — 🎁 подарок за заказ от 10000₽, бесплатно" (31.10). Без обрезки в название
+      // попадал хвост "— за заказ от", и совпадение с каталогом считалось не 1-в-1.
+      if (isGift) pRaw = pRaw.split(/\s[-–—]\s/)[0];
       pRaw = pRaw.replace(/(подарок к заказу|презент к заказу|подарок|презент|сырный презент|🎁|\(?не режем\)?)/gi, '').trim();
       pRaw = pRaw.replace(/[-–—]\s*$/, '').trim();
 
