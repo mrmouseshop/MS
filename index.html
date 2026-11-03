@@ -362,15 +362,33 @@ function saveGiftLosses(list) {
   try { localStorage.setItem(GIFT_LOSSES_KEY, JSON.stringify(list)); } catch (e) { /* хранилище недоступно — просто не сохраняем */ }
 }
 
+// Списания, уже отмеченные "Проверил(а)", — чтобы повторный прогон того же отчёта не
+// возвращал их в карточку снова.
+const GIFT_LOSSES_DONE_KEY = 'ms_gift_losses_done';
+function loadGiftLossesDone() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GIFT_LOSSES_DONE_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
 function addGiftLoss(entry) {
   const list = loadGiftLosses();
   if (list.some(e => e.lossId === entry.lossId)) return;
+  if (loadGiftLossesDone().includes(entry.lossId)) return;
   list.push(entry);
   saveGiftLosses(list);
   renderGiftLosses();
 }
 
 function removeGiftLoss(lossId) {
+  const done = loadGiftLossesDone();
+  if (!done.includes(lossId)) {
+    done.push(lossId);
+    try { localStorage.setItem(GIFT_LOSSES_DONE_KEY, JSON.stringify(done.slice(-500))); } catch (e) { /* не критично */ }
+  }
   saveGiftLosses(loadGiftLosses().filter(e => e.lossId !== lossId));
   renderGiftLosses();
 }
@@ -455,7 +473,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '03.11.2026-3 (карточка «Списания подарков»)';
+const APP_VERSION = '03.11.2026-4 (уже созданные списания тоже в карточке)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1177,7 +1195,9 @@ async function lossAlreadyExists(dateStr, descTextFull) {
   const data = await resp.json();
   const descNorm = normalizeDescForCompare(descTextFull);
   for (const row of (data.rows || [])) {
-    if (normalizeDescForCompare(row.description) === descNorm) return true;
+    // Возвращаем саму найденную запись (а не просто true) — её id нужен, чтобы уже
+    // существующее списание тоже попало в карточку "🎁 Списания подарков" при повторном прогоне.
+    if (normalizeDescForCompare(row.description) === descNorm) return row;
   }
   return false;
 }
@@ -2302,8 +2322,15 @@ async function processReport(reportTextRaw) {
     if (itemsLoss.length) {
       const fullDesc = `${header}\n${block.trim()}`;
       const fullLossDesc = `🎁 Списание подарков по заказу:\n${fullDesc}`;
-      if (await lossAlreadyExists(reportDate, fullLossDesc)) {
+      const existingLoss = await lossAlreadyExists(reportDate, fullLossDesc);
+      if (existingLoss) {
         log(`  [ПРОПУСК] Списание подарков для [${header}] (${name}) уже есть в МоемСкладе — дубль не создаю.`);
+        // Документ настоящий (найден в МоемСкладе) — показываем его в карточке, если его там
+        // ещё нет и он не был уже отмечен "Проверил(а)".
+        if (existingLoss.id) {
+          addGiftLoss({ header, counterparty: name, lossId: existingLoss.id, date: reportDate,
+                        items: itemsLoss.map(it => ({ name: it._name, qty: it.quantity })) });
+        }
       } else {
         const lossResult = await createLoss(itemsLoss, reportDate, fullDesc);
         if (lossResult) {
