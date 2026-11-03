@@ -349,7 +349,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '02.11.2026 (Бри/Камамбер Field Dairy в словаре)';
+const APP_VERSION = '03.11.2026-2 (сдача «N рублей»)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -451,7 +451,7 @@ const MANUAL_MAP = {
   'манчего dop (9 мес)': 'Манчего DOP (9 мес)',
   'олд амстердам (коровий)': 'Олд Амстердам (коровий)',
   'Олд Амстердам коровий (резерв)': 'Олд Амстердам коровий (резерв)',
-  'набор хамон (палета) серрано espana la barrica': 'Набор Хамон (Палета) Серрано ESPANA la Barrica',
+  'набор хамон (палета) серрано espana la barrica': 'Набор Хамон (Палета) Серрано ESPANA la Barrica ~4.5кг',
   // Old Irish — в каталоге ОДНА весовая карточка-ассорти на все вкусы (подтверждено 23.10),
   // в отчёте менеджеры пишут конкретный вкус. Ключи без апострофа ("luck", а не "luck o'"),
   // чтобы не зависеть от того, прямой он или типографский.
@@ -861,6 +861,19 @@ function isDiscountExcluded(item) {
   return false;
 }
 
+// Пояснение в журнал, ПОЧЕМУ к позиции не применилась общая скидка заказа — раньше писалось
+// только "(в списке исключений)", и было непонятно, что, например, сработало правило "цена в
+// отчёте ниже каталожной = товар уже уценён" (реальный случай 03.11, заказ 4).
+function discountExclusionNote(item) {
+  if (item._alreadyDiscounted) return ' — уже со скидкой ([SALE] или своя скидка на позицию)';
+  const nameLower = (item._name || '').toLowerCase();
+  if (DISCOUNT_EXCLUDE_KEYWORDS.some(kw => nameLower.includes(kw))) return ' — в ручном списке исключений';
+  if (item._catalog_price) {
+    return ` — цена в отчёте ${(item.price / 100).toFixed(2)} ₽ ниже каталожной ${(item._catalog_price / 100).toFixed(2)} ₽, считаю уже уценённой`;
+  }
+  return '';
+}
+
 /* ===================== ЦЕНА ИЗ ТЕКСТА ОТЧЁТА ===================== */
 
 function extractTextPrice(content) {
@@ -925,7 +938,9 @@ function normCpName(s) {
   return (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 function counterpartyNameParts(fullName) {
-  return (fullName || '').split('|').map(normCpName).filter(Boolean);
+  // Разделитель — " | " (так дописывает программа) или "/" (так иногда пишут вручную:
+  // "Александр ави/Aleksandr тг").
+  return (fullName || '').split(/[|\/]/).map(normCpName).filter(Boolean);
 }
 
 // Контрагент нашёлся по ТЕЛЕФОНУ, но в отчёте он записан под другим именем (например в
@@ -1114,7 +1129,9 @@ function extractReportTotalKopecks(blockText) {
   // заказу" выше, но здесь хвост — произвольное(ые) слово(а), а не фиксированная фраза).
   function extractOneTotalRub(tailRaw) {
     let carryoverRub = 0.0;
-    const carryoverRegex = /\(\s*(\d+(?:[.,]\d+)?)\s*(?:р|руб)?\.?\s*(?:к\s+след[а-яё]*\s+заказ[а-яё]*|переплат[а-яё]*|сдач[а-яё]*(?:\s+\S+)*)\s*\)/gi;
+    // Единица — "р", "руб", "рубля", "рублей" ("(100 рублей сдача)", 03.11 заказ 4): раньше
+    // "рублей" не проходило, сдача не вычиталась, и вылезала ложная "НЕСОСТЫКОВКА" на её сумму.
+    const carryoverRegex = /\(\s*(\d+(?:[.,]\d+)?)\s*(?:р(?:уб[а-яё]*)?|₽)?\.?\s*(?:к\s+след[а-яё]*\s+заказ[а-яё]*|переплат[а-яё]*|сдач[а-яё]*(?:\s+\S+)*)\s*\)/gi;
     let cm;
     while ((cm = carryoverRegex.exec(tailRaw)) !== null) {
       carryoverRub += parseFloat(cm[1].replace(',', '.'));
@@ -2049,7 +2066,7 @@ async function processReport(reportTextRaw) {
           const excluded = [];
           for (const it of itemsSell) {
             if (isDiscountExcluded(it)) {
-              excluded.push(it._name);
+              excluded.push(it._name + discountExclusionNote(it));
               continue;
             }
             const pct = Math.round((perUnitRub / (it.price / 100)) * 10000) / 100;
@@ -2057,7 +2074,7 @@ async function processReport(reportTextRaw) {
             discounted.push(it._name);
           }
           if (discounted.length) log(`  [СКИДКА ${perUnitRub}₽/шт] Применена к: ${discounted.join(', ')}`);
-          if (excluded.length) log(`  [СКИДКА ${perUnitRub}₽/шт] НЕ применена (в списке исключений) к: ${excluded.join(', ')}`);
+          if (excluded.length) log(`  [СКИДКА ${perUnitRub}₽/шт] НЕ применена к: ${excluded.join(', ')}`);
           perUnitHandled = true;
         }
       }
@@ -2086,14 +2103,14 @@ async function processReport(reportTextRaw) {
         const excluded = [];
         for (const it of itemsSell) {
           if (isDiscountExcluded(it)) {
-            excluded.push(it._name);
+            excluded.push(it._name + discountExclusionNote(it));
           } else {
             it.discount = discountPercent;
             discounted.push(it._name);
           }
         }
         if (discounted.length) log(`  [СКИДКА ${discountLabel}] Применена к: ${discounted.join(', ')}`);
-        if (excluded.length) log(`  [СКИДКА ${discountLabel}] НЕ применена (в списке исключений) к: ${excluded.join(', ')}`);
+        if (excluded.length) log(`  [СКИДКА ${discountLabel}] НЕ применена к: ${excluded.join(', ')}`);
       }
     }
 
