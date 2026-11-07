@@ -473,7 +473,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '03.11.2026-4 (уже созданные списания тоже в карточке)';
+const APP_VERSION = '07.11.2026 (пустые имена вроде «. тг» не дописываются)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1075,6 +1075,14 @@ function counterpartyNameParts(fullName) {
 async function appendCounterpartyAlias(row, reportName) {
   const alias = (reportName || '').replace(/\s+/g, ' ').trim();
   if (!alias || !row || !row.id) return;
+  // Имя без содержания — только пометка мессенджера и точки/эмодзи (". тг", "😁 тг", "мах") —
+  // ничего не говорит о клиенте, такое не дописываем (реальный случай 06.11: ". тг").
+  const MESSENGER_TAGS = ['тг', 'tg', 'ави', 'avi', 'max', 'мах', 'макс', 'вотс', 'воц', 'вц', 'wa', 'ватсап', 'whatsapp', 'вк', 'vk', 'инст', 'inst'];
+  const meaningful = alias.split(' ').filter(t => {
+    const letters = t.toLowerCase().replace(/[^a-zа-яё0-9]/g, '');
+    return letters && !MESSENGER_TAGS.includes(letters);
+  });
+  if (!meaningful.length) return;
   if (counterpartyNameParts(row.name).includes(normCpName(alias))) return;
   const newName = `${(row.name || '').trim()} | ${alias}`;
   if (newName.length > 255) {
