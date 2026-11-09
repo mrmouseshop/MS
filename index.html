@@ -473,7 +473,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '09.11.2026-2 (ОЗОН «Готов к отгрузке» — не проводится)';
+const APP_VERSION = '09.11.2026-3 (~ в названиях, вес только для весовых, дубли имён)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -654,6 +654,21 @@ function extractSizeGrams(s) {
 // журнале — его увидели только случайно, разглядывая сплошной текст. Эта проверка используется
 // ниже, чтобы ЛЮБОЕ нечёткое совпадение (а не только то, что попутно поймала проверка цены)
 // явно помечалось отдельным тегом в журнале и попадало в сводку "ПРОВЕРЬТЕ НАЗВАНИЕ".
+// Похоже ли, что товар продаётся на вес (кусками)? Нужно, чтобы не шуметь "вес не указан"
+// про штучные товары в несобранных ОЗОН-заказах (реальный случай 08.11: "Фуагра ассорти 150гр").
+// Штучный — если это набор/подарочный, или в названии есть точная фасовка без "~"
+// ("150гр", "500гр", "200мл"). Весовой — "~1кг", "~300гр" или фасовки нет вовсе.
+function looksWeighed(name) {
+  const n = (name || '').toLowerCase();
+  if (/^\s*(?:набор|подарочн)/.test(n)) return false;
+  const re = /(~\s*)?\d+(?:[.,]\d+)?\s*(?:гр|г|кг|мл|л|шт)(?![а-яёa-z])/g;
+  let m;
+  while ((m = re.exec(n))) {
+    if (!m[1]) return false;
+  }
+  return true;
+}
+
 function namesMatchExactly(reportText, catalogName) {
   // Сворачиваем омоглифы (как и сам нечёткий поиск выше) и убираем чисто косметический "мусор"
   // (висячее тире/точку на конце названия, двойные пробелы) — иначе, например, "Prima Donna
@@ -666,6 +681,9 @@ function namesMatchExactly(reportText, catalogName) {
     .replace(/\[\s*sale\s*\]/gi, '')
     .replace(/[«»"'„“”]/g, '')
     .replace(/[-–—.,]+\s*$/g, '')
+    // "~" (приблизительный вес куска) — тоже косметика: "Gran Duca 30 мес ~300гр" в отчёте и
+    // "Gran Duca 30 мес 300гр" в каталоге — один и тот же товар (реальный случай 08.11).
+    .replace(/~/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   return norm(reportText) === norm(catalogName);
@@ -1086,6 +1104,14 @@ async function appendCounterpartyAlias(row, reportName) {
   });
   if (!meaningful.length) return;
   if (counterpartyNameParts(row.name).includes(normCpName(alias))) return;
+  // То же имя, отличается только пометкой мессенджера ("Расщепаев Дмитрий" в МоёмСкладе и
+  // "Расщепаев Дмитрий тг" в отчёте, реальный случай 08.11) — это не новое имя, не дописываем.
+  const nameCore = s => normCpName(s).split(' ').filter(t => {
+    const letters = t.replace(/[^a-zа-яё0-9]/g, '');
+    return letters && !MESSENGER_TAGS.includes(letters);
+  }).join(' ');
+  const aliasCore = nameCore(alias);
+  if (counterpartyNameParts(row.name).some(part => nameCore(part) === aliasCore)) return;
   const newName = `${(row.name || '').trim()} | ${alias}`;
   if (newName.length > 255) {
     log(`  [ПРЕДУПРЕЖДЕНИЕ] Имя контрагента '${row.name}' слишком длинное, чтобы дописать '${alias}' — оставляю как есть.`);
@@ -1688,7 +1714,9 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
         log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' не указан вес куска — позицию не отгружаю, проведите вручную.`);
         continue;
       }
-      log(`  [ПРЕДУПРЕЖДЕНИЕ] В заказе ОЗОН [${header}] у '${article}' ещё не указан вес (заказ не собран) — в черновик отгрузки поставлено ${qty} шт, поправьте количество, когда кусок взвесят.`);
+      if (looksWeighed(productData.name)) {
+        log(`  [ПРЕДУПРЕЖДЕНИЕ] В заказе ОЗОН [${header}] у '${article}' ещё не указан вес (заказ не собран) — в черновик отгрузки поставлено ${qty} шт, поправьте количество, когда кусок взвесят.`);
+      }
     }
     // Если артикула нет в таблице, но он оканчивается на "_xN" (так названы все наборы —
     // "CV_..._x2", "_x3", "_x4"), берём N из самого артикула. Реальный случай 07.11:
@@ -1696,7 +1724,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
     const tableMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()];
     const suffixMatch = article.match(/_x(\d{1,2})$/i);
     const qtyMultiplier = tableMultiplier || (suffixMatch ? parseInt(suffixMatch[1], 10) : 1);
-    if (isPendingStatus && noWeightField && qtyMultiplier === 1) {
+    if (isPendingStatus && noWeightField && qtyMultiplier === 1 && looksWeighed(productData.name)) {
       // Несобранный заказ: вес куска ещё не вписан (поля веса нет вовсе). Для штучного товара
       // это нормально, для весового — в черновик уйдёт "1" (кг), и его надо поправить при сборке.
       log(`  [ПРЕДУПРЕЖДЕНИЕ] Заказ ОЗОН [${header}] ещё не собран, вес у '${article}' не указан — в черновике ${qty}; если товар весовой, поправьте количество, когда кусок взвесят.`);
