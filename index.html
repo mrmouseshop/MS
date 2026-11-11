@@ -267,6 +267,37 @@ function apiUrl(path) {
   return CONFIG.workerUrl + path;
 }
 
+// МойСклад ограничивает частоту запросов: при большом отчёте (35 заказов 10.11) он начинал
+// отвечать 429 "слишком много запросов", и проверка дублей пропускалась. Теперь на 429 ждём
+// (сколько просит МойСклад в заголовке X-Lognex-Retry-TimeInterval, иначе 1–3 с) и повторяем.
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+async function msFetch(url, opts) {
+  let resp;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    resp = await fetch(url, opts);
+    if (!resp || resp.status !== 429) return resp;
+    let waitMs = 1000 + attempt * 500;
+    try {
+      const h = resp.headers && resp.headers.get && resp.headers.get('X-Lognex-Retry-TimeInterval');
+      if (h && !isNaN(parseInt(h, 10))) waitMs = Math.min(10000, parseInt(h, 10) + 200);
+    } catch (e) { /* без заголовка — ждём по умолчанию */ }
+    await sleepMs(waitMs);
+  }
+  return resp;
+}
+
+// Проверка дублей не удалась даже после повторов. В тестовом прогоне — просто предупреждаем;
+// в настоящем — останавливаем обработку, чтобы НЕ создать дубль. Повторный запуск безопасен:
+// уже созданное программа найдёт и пропустит.
+function dupCheckFailed(what, status) {
+  if (DRY_RUN) {
+    log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось проверить дубликаты ${what} (код ${status}). Продолжаю без проверки.`);
+    return;
+  }
+  throw new Error(`МойСклад не дал проверить дубликаты ${what} (код ${status}). Обработка остановлена, чтобы не создать дубль. ` +
+    `Подождите минуту и нажмите «Провести» ещё раз — уже созданное повторно не создастся.`);
+}
+
 function msHeaders() {
   return {
     'Authorization': 'Bearer ' + CONFIG.token,
@@ -558,7 +589,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '11.11.2026-2 (заглушка 404 с паролем)';
+const APP_VERSION = '11.11.2026-4 (таблица наборов ОЗОН дополнена)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -568,7 +599,7 @@ const DISCOUNT_EXCLUDE_KEYWORDS = []; // ручной список сверх о
 async function loadProducts() {
   log(`Версия программы: ${APP_VERSION}`);
   log('Загружаю базу товаров из МоегоСклада...');
-  const resp = await fetch(apiUrl('/entity/product?limit=1000'), { headers: msHeaders() });
+  const resp = await msFetch(apiUrl('/entity/product?limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
     log(`  [ОШИБКА API] Не удалось загрузить товары (код ${resp.status}): ${await resp.text()}`);
     throw new Error('load_products failed');
@@ -1191,10 +1222,11 @@ async function appendCounterpartyAlias(row, reportName) {
   if (counterpartyNameParts(row.name).includes(normCpName(alias))) return;
   // То же имя, отличается только пометкой мессенджера ("Расщепаев Дмитрий" в МоёмСкладе и
   // "Расщепаев Дмитрий тг" в отчёте, реальный случай 08.11) — это не новое имя, не дописываем.
-  const nameCore = s => normCpName(s).split(' ').filter(t => {
-    const letters = t.replace(/[^a-zа-яё0-9]/g, '');
-    return letters && !MESSENGER_TAGS.includes(letters);
-  }).join(' ');
+  // Знаки вокруг слов ("~Василий Фролов воц", реальный случай 10.11) тоже не в счёт.
+  const nameCore = s => normCpName(s).split(' ')
+    .map(t => t.replace(/[^a-zа-яё0-9]/g, ''))
+    .filter(t => t && !MESSENGER_TAGS.includes(t))
+    .join(' ');
   const aliasCore = nameCore(alias);
   if (counterpartyNameParts(row.name).some(part => nameCore(part) === aliasCore)) return;
   const newName = `${(row.name || '').trim()} | ${alias}`;
@@ -1207,7 +1239,7 @@ async function appendCounterpartyAlias(row, reportName) {
     return;
   }
   try {
-    const resp = await fetch(apiUrl('/entity/counterparty/' + row.id), { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ name: newName }) });
+    const resp = await msFetch(apiUrl('/entity/counterparty/' + row.id), { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ name: newName }) });
     if (resp.ok) {
       log(`  [Контрагент] Имя дополнено: '${row.name}' -> '${newName}'`);
       row.name = newName;
@@ -1224,7 +1256,7 @@ async function getOrCreateCounterparty(name, phone) {
 
   if (cleanPhone && cleanPhone.length >= 10) {
     const searchPhone = cleanPhone.slice(-10);
-    const resp = await fetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(searchPhone)), { headers: msHeaders() });
+    const resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(searchPhone)), { headers: msHeaders() });
     if (resp.ok) {
       const data = await resp.json();
       const rows = data.rows || [];
@@ -1236,7 +1268,7 @@ async function getOrCreateCounterparty(name, phone) {
     }
   }
 
-  let resp = await fetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(name)), { headers: msHeaders() });
+  let resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(name)), { headers: msHeaders() });
   if (resp.ok) {
     const data = await resp.json();
     for (const row of (data.rows || [])) {
@@ -1257,7 +1289,7 @@ async function getOrCreateCounterparty(name, phone) {
   const newCp = { name: name };
   if (phone) newCp.phone = phone;
 
-  resp = await fetch(apiUrl('/entity/counterparty'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(newCp) });
+  resp = await msFetch(apiUrl('/entity/counterparty'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(newCp) });
   if (resp.status === 200 || resp.status === 201) {
     const data = await resp.json();
     log(`  [Контрагент] СОЗДАН НОВЫЙ: ${name} (Телефон: ${phone})`);
@@ -1292,9 +1324,9 @@ function normalizeDescForCompare(s) {
 
 async function demandAlreadyExists(cId, dateStr, descText) {
   const params = `moment>=${dateStr} 00:00:00;moment<=${dateStr} 23:59:59`;
-  const resp = await fetch(apiUrl('/entity/demand?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
+  const resp = await msFetch(apiUrl('/entity/demand?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
-    log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось проверить дубликаты отгрузок (код ${resp.status}). Продолжаю без проверки.`);
+    dupCheckFailed('отгрузок', resp.status);
     return false;
   }
   const data = await resp.json();
@@ -1308,9 +1340,9 @@ async function demandAlreadyExists(cId, dateStr, descText) {
 
 async function lossAlreadyExists(dateStr, descTextFull) {
   const params = `moment>=${dateStr} 00:00:00;moment<=${dateStr} 23:59:59`;
-  const resp = await fetch(apiUrl('/entity/loss?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
+  const resp = await msFetch(apiUrl('/entity/loss?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
-    log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось проверить дубликаты списаний (код ${resp.status}). Продолжаю без проверки.`);
+    dupCheckFailed('списаний', resp.status);
     return false;
   }
   const data = await resp.json();
@@ -1325,9 +1357,9 @@ async function lossAlreadyExists(dateStr, descTextFull) {
 
 async function paymentAlreadyExists(cId, dateStr, descText) {
   const params = `moment>=${dateStr} 00:00:00;moment<=${dateStr} 23:59:59`;
-  const resp = await fetch(apiUrl('/entity/paymentin?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
+  const resp = await msFetch(apiUrl('/entity/paymentin?filter=' + encodeURIComponent(params) + '&limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
-    log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось проверить дубликаты платежей (код ${resp.status}). Продолжаю без проверки.`);
+    dupCheckFailed('платежей', resp.status);
     return false;
   }
   const data = await resp.json();
@@ -1561,7 +1593,7 @@ async function createDemand(cId, items, dateStr, descText, opts) {
     applicable,
     positions: stripInternalFields(items),
   };
-  const resp = await fetch(apiUrl('/entity/demand'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
+  const resp = await msFetch(apiUrl('/entity/demand'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
   if (resp.status === 200 || resp.status === 201) return await resp.json();
   log(`  !!! ОШИБКА МС (Код ${resp.status}): ${await resp.text()}`);
   return null;
@@ -1577,7 +1609,7 @@ async function createPaymentIn(cId, demandMeta, amountKopecks, dateStr, descText
     description: descText,
     operations: [{ meta: demandMeta, linkedSum: amountKopecks }],
   };
-  const resp = await fetch(apiUrl('/entity/paymentin'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
+  const resp = await msFetch(apiUrl('/entity/paymentin'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
   if (resp.status === 200 || resp.status === 201) return true;
   log(`  !!! ОШИБКА СОЗДАНИЯ ПЛАТЕЖА (Код ${resp.status}): ${await resp.text()}`);
   return false;
@@ -1592,7 +1624,7 @@ async function createLoss(items, dateStr, descText) {
     description: `🎁 Списание подарков по заказу:\n${descText}`,
     positions: stripInternalFields(items),
   };
-  const resp = await fetch(apiUrl('/entity/loss'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
+  const resp = await msFetch(apiUrl('/entity/loss'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(payload) });
   if (resp.status === 200 || resp.status === 201) {
     // Возвращаем id созданного документа (не просто true), чтобы вызывающий код мог
     // сразу дать пользователю прямую ссылку на настоящую страницу документа в МоемСкладе —
@@ -1711,6 +1743,8 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_jamon_rodriguez_serrano_250g_x2': 2,
   'cv_jamon_nico_serrano_250g_x2': 2,
   'cv_parmesan_granduca_30mes_x2': 2,
+  'cv_babybel_mini_60g_x4': 4,
+  'cv_pecorino_romano_quattrocolli_200g_x2': 2,
 };
 
 async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] }) {
@@ -1758,10 +1792,19 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
     const m = line.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*([^,]+?)\s*(,\s*(\d+(?:[.,]\d+)?)?\s*)?$/i);
     if (m) {
       const qty = parseFloat(m[1].replace(',', '.'));
-      const weight = m[4] !== undefined ? parseFloat(m[4].replace(',', '.')) : null;
-      const weightMissing = m[3] !== undefined && m[4] === undefined;
-      const noWeightField = m[3] === undefined;
-      ozonLines.push({ qty: weight !== null ? weight : qty, article: m[2].trim(), weightMissing, noWeightField });
+      let article = m[2].trim();
+      let weight = m[4] !== undefined ? parseFloat(m[4].replace(',', '.')) : null;
+      let weightMissing = m[3] !== undefined && m[4] === undefined;
+      let noWeightField = m[3] === undefined;
+      // Вес через ПРОБЕЛ вместо запятой: "1 шт, CV_Frico_Chevrette 0.51" (новый формат с 10.11).
+      const spaceW = noWeightField && article.match(/^(\S+)\s+(\d+(?:[.,]\d+)?)$/);
+      if (spaceW) {
+        article = spaceW[1];
+        weight = parseFloat(spaceW[2].replace(',', '.'));
+        noWeightField = false;
+        weightMissing = false;
+      }
+      ozonLines.push({ qty: weight !== null ? weight : qty, article, weightMissing, noWeightField });
     }
   }
 
@@ -1990,6 +2033,26 @@ async function processReport(reportTextRaw) {
       name = 'Без имени';
     } else {
       name = lines[nameIdx];
+    }
+    // Вместо имени записан телефон ("+7 914 790-87-23 воц", реальный заказ 1 от 10.11) —
+    // берём ФИО получателя из шапки заказа ("Валерий Валендо") и сохраняем пометку мессенджера.
+    {
+      const tagPart = name.replace(/[+\d\s()\-]/g, ' ').replace(/\s+/g, ' ').trim();
+      const digits = name.replace(/\D/g, '');
+      if (digits.length >= 10 && digits.length <= 12 && !/[a-zа-яё]{3,}/i.test(tagPart.replace(/^(тг|tg|ави|avi|max|мах|макс|вотс|воц|вц|wa|вк|vk|инст|inst)$/i, ''))) {
+        const ADDRESS_WORD = /(?:^|\s)(?:ул|улица|пр|проспект|аллея|переулок|пер|шоссе|бульвар|буль|наб|набережная|проезд|площадь|г|город|дом|д|кв|корпус|подъезд|под|этаж|домофон|мкр|район|обл|область|край)\.?(?=\s|$|,)/i;
+        let fio = null;
+        for (let i = nameIdx + 1; i < lines.length; i++) {
+          const l = lines[i].trim();
+          if (/^\d+[)\.]\s+/.test(l)) break;
+          if (/^[A-Za-zА-Яа-яЁё.\-]+(?:\s+[A-Za-zА-Яа-яЁё.\-]+){1,2}$/.test(l) && !ADDRESS_WORD.test(l)) fio = l;
+        }
+        if (fio) {
+          const newName = tagPart ? `${fio} ${tagPart}` : fio;
+          log(`  [ПРЕДУПРЕЖДЕНИЕ] В заказе [${header}] вместо имени клиента записан телефон — контрагент будет назван по ФИО из заказа: '${newName}'.`);
+          name = newName;
+        }
+      }
     }
 
     let itemsSell = [];
@@ -2441,7 +2504,10 @@ async function processReport(reportTextRaw) {
               // руководитель мог сам проверить, откуда оно взялось.
               const toleranceKop = Math.max(10000, calculatedKop * 0.001);
               const diffKop = calculatedKop - reportKop;
-              const hasMismatch = Math.abs(diffKop) > 1; // >1 копейки — чтобы не шуметь на копеечные ошибки округления float
+              // Отчёт округляет каждую весовую позицию до рубля, поэтому расхождение до 50 коп. на
+              // позицию — это просто округление (10.11: 5 заказов с разницей 0.30–1.50 ₽), не шумим.
+              const roundingKop = 50 * Math.max(1, itemsSell.length) + 1;
+              const hasMismatch = Math.abs(diffKop) > roundingKop;
 
               if (hasMismatch) {
                 const sign = diffKop >= 0 ? '+' : '';
@@ -2459,7 +2525,7 @@ async function processReport(reportTextRaw) {
                   log(`  [ПРОПУСК] Входящий платёж для [${header}] (${name}) уже есть в МоемСкладе — дубль не создаю.`);
                 } else if (await createPaymentIn(cId, demandResult.meta, paymentSum, reportDate, paymentDesc)) {
                   log(`  => 💰 Входящий платёж на ${(paymentSum / 100).toFixed(2)} ₽ для [${header}] (${name}) создан` +
-                      `${hasMismatch ? ' (в пределах допустимой погрешности — см. уведомление выше)' : ' (сумма позиций совпала с отчётом)'}.${drSuffix()}`);
+                      `${hasMismatch ? ' (в пределах допустимой погрешности — см. уведомление выше)' : (Math.abs(diffKop) > 1 ? ' (сумма позиций совпала с отчётом с точностью до округления)' : ' (сумма позиций совпала с отчётом)')}.${drSuffix()}`);
                 } else {
                   log(`  [ОШИБКА API] МойСклад не смог создать платёж для '${name}'.`);
                   stats.missingPayments++;
@@ -2594,7 +2660,7 @@ document.getElementById('testConnBtn').addEventListener('click', async () => {
   }
   settingsStatusEl.textContent = 'Проверяю...';
   try {
-    const resp = await fetch(apiUrl('/entity/product?limit=1'), { headers: msHeaders() });
+    const resp = await msFetch(apiUrl('/entity/product?limit=1'), { headers: msHeaders() });
     if (resp.ok) {
       const data = await resp.json();
       const total = data.meta ? data.meta.size : '?';
