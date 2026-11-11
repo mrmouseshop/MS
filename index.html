@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Обработка отчёта — МойСклад</title>
+<title>404 Not Found</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -73,9 +73,94 @@
   .gift-item ul { margin: 4px 0 0; padding-left: 18px; }
   .gift-item a { display: block; margin-top: 6px; color: #a21caf; font-weight: 600; text-decoration: underline; }
   .gift-item button { margin-top: 8px; padding: 8px 12px; font-size: 13px; width: 100%; }
+  /* ===== Заглушка "404": пока не введён пароль, видна только она ===== */
+  body.locked { max-width: none; margin: 8px; padding: 0; background: #fff; color: #000;
+    font-family: "Times New Roman", Times, serif; }
+  body.locked > *:not(#gate) { display: none !important; }
+  body:not(.locked) #gate { display: none; }
+  #gate h1 { font-size: 2em; margin: 0.67em 0; text-align: center; font-weight: bold; }
+  #gate hr { border: 0; border-top: 1px solid #aaa; margin: 8px 0; }
+  #gate .srv { text-align: center; }
+  #gateCorner { position: fixed; right: 0; bottom: 0; width: 56px; height: 56px;
+    cursor: default; -webkit-tap-highlight-color: transparent; z-index: 10; }
+  #gatePass { position: fixed; right: 12px; bottom: 12px; width: 120px; font: 14px monospace;
+    padding: 4px 6px; border: 1px solid #ccc; background: #fff; color: #000; z-index: 11; }
 </style>
 </head>
-<body>
+<body class="locked">
+
+<div id="gate">
+  <h1>404 Not Found</h1>
+  <hr>
+  <div class="srv">nginx</div>
+  <div id="gateCorner"></div>
+  <input id="gatePass" type="password" autocomplete="off" hidden>
+</div>
+<script>
+// Заглушка "404". Тайное место — невидимый квадрат в правом нижнем углу: 3 нажатия
+// подряд (в пределах 1.5 с) показывают поле пароля. Пароль в файле не хранится —
+// только его SHA-256 хэш. После правильного ввода приложение открыто до закрытия вкладки.
+(function () {
+  const GATE_HASH = 'e5f76eaa08326d9a9c8b029371ef6a05395a0810ae0861a90f7c6864d20dbfcf';
+  const APP_TITLE = 'Обработка отчёта — МойСклад';
+  function sha256hex(str) {
+    const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+    const bytes = Array.from(new TextEncoder().encode(str));
+    const bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    for (let i = 7; i >= 0; i--) bytes.push(i >= 4 ? 0 : (bitLen >>> (i * 8)) & 0xff);
+    let h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    const r = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let off = 0; off < bytes.length; off += 64) {
+      const w = new Array(64);
+      for (let i = 0; i < 16; i++) w[i] = (bytes[off+4*i] << 24) | (bytes[off+4*i+1] << 16) | (bytes[off+4*i+2] << 8) | bytes[off+4*i+3];
+      for (let i = 16; i < 64; i++) {
+        const s0 = r(w[i-15], 7) ^ r(w[i-15], 18) ^ (w[i-15] >>> 3);
+        const s1 = r(w[i-2], 17) ^ r(w[i-2], 19) ^ (w[i-2] >>> 10);
+        w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+      }
+      let [a, b, c, d, e, f, g, hh] = h;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+        const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      h = [h[0]+a, h[1]+b, h[2]+c, h[3]+d, h[4]+e, h[5]+f, h[6]+g, h[7]+hh].map(x => x | 0);
+    }
+    return h.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+  }
+  window.__gateSha256 = sha256hex;
+  function unlock() {
+    document.body.classList.remove('locked');
+    document.title = APP_TITLE;
+    try { sessionStorage.setItem('ms_gate_ok', '1'); } catch (e) {}
+  }
+  let ok = false;
+  try { ok = sessionStorage.getItem('ms_gate_ok') === '1'; } catch (e) {}
+  if (ok) { unlock(); return; }
+  const corner = document.getElementById('gateCorner');
+  const pass = document.getElementById('gatePass');
+  let taps = [];
+  corner.addEventListener('click', () => {
+    const now = Date.now();
+    taps = taps.filter(t => now - t < 1500);
+    taps.push(now);
+    if (taps.length >= 3) { taps = []; pass.hidden = false; pass.value = ''; pass.focus(); }
+  });
+  // Проверяем на каждый ввод символа — на телефоне у цифровой клавиатуры может не быть Enter.
+  pass.addEventListener('input', () => {
+    if (sha256hex('ms-gate:' + pass.value) === GATE_HASH) { pass.value = ''; unlock(); }
+  });
+  pass.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { pass.hidden = true; pass.value = ''; return; }
+    if (e.key !== 'Enter') return;
+    if (sha256hex('ms-gate:' + pass.value) === GATE_HASH) { pass.value = ''; unlock(); }
+    else { pass.value = ''; pass.hidden = true; }
+  });
+  pass.addEventListener('blur', () => { if (!pass.value) pass.hidden = true; });
+})();
+</script>
 
   <h1>Обработка отчёта продаж</h1>
   <p class="hint">Вставь текст отчёта, нажми «Провести». Приложение создаст отгрузки, списания подарков и входящие платежи в МоемСкладе — как раньше делал скрипт на компьютере.</p>
@@ -473,7 +558,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '11.11.2026-1 (две строки «Итого» подряд — берётся последняя)';
+const APP_VERSION = '11.11.2026-2 (заглушка 404 с паролем)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
