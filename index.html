@@ -65,6 +65,14 @@
   .pending-item b { color: #9a3412; }
   .pending-item a { display: block; margin-top: 6px; color: #c2410c; font-weight: 600; text-decoration: underline; }
   .pending-item button { margin-top: 8px; padding: 8px 12px; font-size: 13px; width: 100%; }
+  .cancel-item {
+    border: 1px solid #fecaca; background: #fef2f2; border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; font-size: 13px; line-height: 1.5;
+  }
+  .cancel-item b { color: #991b1b; }
+  .cancel-item ul { margin: 4px 0 0; padding-left: 18px; }
+  .cancel-item a { display: block; margin-top: 6px; color: #b91c1c; font-weight: 600; text-decoration: underline; }
+  .cancel-item button { margin-top: 8px; padding: 8px 12px; font-size: 13px; width: 100%; }
   .gift-item {
     border: 1px solid #f5d0fe; background: #fdf4ff; border-radius: 10px;
     padding: 10px 12px; margin-bottom: 8px; font-size: 13px; line-height: 1.5;
@@ -205,6 +213,12 @@
   </div>
 
   <div class="card">
+    <h2>❌ Отменённые ОЗОН — проверить <span class="badge" id="cancelledOzonCount">пусто</span></h2>
+    <p class="hint">Заказы ОЗОН со статусом «Отменён» — по ним создан пустой документ, товар со склада НЕ списан. Если заказ отменили в день передачи в доставку, товар мог физически уехать: тогда без отгрузки возврат ляжет на склад «лишним» приходом, а потом всплывёт недостача. Проверь, уехал ли товар, и нажми «Проверил(а)».</p>
+    <div id="cancelledOzonList"></div>
+  </div>
+
+  <div class="card">
     <h2>🎁 Списания подарков <span class="badge" id="giftLossCount">пусто</span></h2>
     <p class="hint">Списания подарков, созданные при проведении отчётов: какой подарок, к какому заказу, ссылка на документ в МоемСкладе. Список сохраняется в этом браузере между запусками — нажимай «Проверил(а)», когда сверил списание.</p>
     <div id="giftLossList"></div>
@@ -321,7 +335,7 @@ function log(msg) {
   if (msg.includes('[OK]')) cls = 'l-ok';
   // [ПРОПУСК] — по просьбе пользователя всегда красным (раньше был серым l-skip и терялся в журнале).
   else if (msg.includes('[ПРОПУСК]')) cls = 'l-error';
-  else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
+  else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('ОТМЕНЁННЫЕ ОЗОН') || msg.includes('[ОЗОН ОТМЕНЁН]') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
            msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') ||
            /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
@@ -452,6 +466,113 @@ function renderPendingOzonOrders() {
     doneBtn.className = 'secondary';
     doneBtn.textContent = '✓ Готово — проверил(а), документ и оплата проведены';
     doneBtn.addEventListener('click', () => removePendingOzonOrder(entry.demandId));
+    item.appendChild(doneBtn);
+
+    listEl.appendChild(item);
+  }
+}
+
+/* ===================== ОТМЕНЁННЫЕ ЗАКАЗЫ ОЗОН (отдельная карточка) ===================== */
+
+// Отменённый заказ ОЗОН программа не отгружает (пустой документ). Но если отмена случилась в
+// день передачи в доставку, товар уже уехал со склада — при возврате приёмка создаст "лишний"
+// товар, и будет недостача. Поэтому каждый отменённый заказ попадает в отдельную карточку для
+// ручной проверки (как "Ждут сборки"). Ключ — дата + номер отправления (id документа может быть
+// неизвестен при повторном прогоне, когда документ уже был создан раньше).
+const CANCELLED_OZON_KEY = 'ms_cancelled_ozon_orders';
+
+function loadCancelledOzon() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CANCELLED_OZON_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveCancelledOzon(list) {
+  try { localStorage.setItem(CANCELLED_OZON_KEY, JSON.stringify(list)); } catch (e) { /* не критично */ }
+}
+
+function cancelledOzonKey(entry) { return `${entry.date}|${entry.posting}`; }
+
+function addCancelledOzon(entry) {
+  const list = loadCancelledOzon();
+  const key = cancelledOzonKey(entry);
+  const existing = list.find(e => cancelledOzonKey(e) === key);
+  if (existing) {
+    if (!existing.demandId && entry.demandId) { existing.demandId = entry.demandId; saveCancelledOzon(list); renderCancelledOzon(); }
+    return;
+  }
+  // Уже отмеченные "Проверил(а)" при повторном прогоне того же отчёта обратно не возвращаем.
+  let done = [];
+  try { done = JSON.parse(localStorage.getItem(CANCELLED_OZON_KEY + '_done') || '[]'); } catch (e) {}
+  if (Array.isArray(done) && done.includes(key)) return;
+  list.push(entry);
+  saveCancelledOzon(list);
+  renderCancelledOzon();
+}
+
+function removeCancelledOzon(key) {
+  saveCancelledOzon(loadCancelledOzon().filter(e => cancelledOzonKey(e) !== key));
+  try {
+    let done = JSON.parse(localStorage.getItem(CANCELLED_OZON_KEY + '_done') || '[]');
+    if (!Array.isArray(done)) done = [];
+    done.push(key);
+    localStorage.setItem(CANCELLED_OZON_KEY + '_done', JSON.stringify(done.slice(-500)));
+  } catch (e) { /* не критично */ }
+  renderCancelledOzon();
+}
+
+function renderCancelledOzon() {
+  const list = loadCancelledOzon();
+  const countEl = document.getElementById('cancelledOzonCount');
+  const listEl = document.getElementById('cancelledOzonList');
+  if (countEl) countEl.textContent = list.length ? String(list.length) : 'пусто';
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  if (!list.length) {
+    const emptyMsg = document.createElement('p');
+    emptyMsg.className = 'hint';
+    emptyMsg.style.margin = '0';
+    emptyMsg.textContent = 'Сейчас нет отменённых заказов для проверки.';
+    listEl.appendChild(emptyMsg);
+    return;
+  }
+  for (const entry of [...list].reverse()) {
+    const item = document.createElement('div');
+    item.className = 'cancel-item';
+
+    const info = document.createElement('div');
+    const infoB = document.createElement('b');
+    infoB.textContent = entry.header;
+    info.appendChild(infoB);
+    info.appendChild(document.createTextNode(' — ' + entry.posting + ' (отчёт от ' + entry.date + ')'));
+    item.appendChild(info);
+
+    if (entry.items && entry.items.length) {
+      const ul = document.createElement('ul');
+      for (const it of entry.items) {
+        const li = document.createElement('li');
+        li.textContent = `${it.qty} × ${it.article}` + (it.name ? ` (${it.name})` : '');
+        ul.appendChild(li);
+      }
+      item.appendChild(ul);
+    }
+
+    if (entry.demandId) {
+      const link = document.createElement('a');
+      link.href = `https://online.moysklad.ru/app/#demand/edit?id=${entry.demandId}`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Открыть документ в МоемСкладе →';
+      item.appendChild(link);
+    }
+
+    const doneBtn = document.createElement('button');
+    doneBtn.className = 'secondary';
+    doneBtn.textContent = '✓ Проверил(а) — товар не уехал / отгрузку поправил';
+    doneBtn.addEventListener('click', () => removeCancelledOzon(cancelledOzonKey(entry)));
     item.appendChild(doneBtn);
 
     listEl.appendChild(item);
@@ -589,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '11.11.2026-4 (таблица наборов ОЗОН дополнена)';
+const APP_VERSION = '12.11.2026-1 (отменённые ОЗОН — отдельный блок для проверки)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1817,8 +1938,20 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
   const cId = await getOrCreateCounterparty(cpRaw, '');
   if (!cId) return;
 
+  // Отменённый заказ — в сводку и в карточку "❌ Отменённые ОЗОН — проверить" (см. выше).
+  const registerCancelled = (demandId) => {
+    const items = ozonLines.map(({ qty, article }) => {
+      const pd = findProductByArticle(article);
+      return { qty, article, name: pd ? pd.name : '' };
+    });
+    if (!stats.cancelledOzon) stats.cancelledOzon = [];
+    stats.cancelledOzon.push({ header, posting: cpRaw, items });
+    if (!DRY_RUN) addCancelledOzon({ header, posting: cpRaw, date: reportDate, items, demandId: demandId || null });
+  };
+
   if (await demandAlreadyExists(cId, reportDate, fullDesc)) {
     log(`  [ПРОПУСК] Отгрузка ОЗОН [${header}] уже есть в МоемСкладе — дубль не создаю.`);
+    if (isCancelled) registerCancelled(null);
     // Если прошлый прогон оборвался МЕЖДУ созданием отгрузки и платежа (например "Failed to
     // fetch" — пропала связь), повторный прогон раньше молча пропускал заказ целиком, и платёж
     // так и не появлялся. Теперь проверяем и платёж тоже (для отменённых/ожидающих он не нужен).
@@ -1836,6 +1969,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
       return;
     }
     log(`  [ОЗОН ОТМЕНЁН] Заказ [${header}] (${cpRaw}) отменён — создан пустой документ (контрагент + комментарий), без товаров и платежа.${drSuffix()}`);
+    registerCancelled(demandResult.id);
     return;
   }
 
@@ -2593,6 +2727,13 @@ async function processReport(reportTextRaw) {
   } else {
     log(`  [OK] Все входящие платежи созданы автоматически.`);
   }
+  if (stats.cancelledOzon && stats.cancelledOzon.length) {
+    log(`  ❌ ОТМЕНЁННЫЕ ОЗОН (сводно): ${stats.cancelledOzon.length} заказ(ов) — товар НЕ списан. Проверьте, не уехал ли он со склада (отмена в день передачи в доставку), иначе при возврате будет «лишний» приход и недостача:`);
+    for (const c of stats.cancelledOzon) {
+      const what = c.items.map(it => `${it.qty} × ${it.article}`).join(', ') || 'товар не указан';
+      log(`    - [${c.header}] ${c.posting}: ${what}`);
+    }
+  }
   if (stats.pendingOzon > 0) {
     log(`  ⏳ ОЖИДАЮТ СБОРКИ (сводно): ${stats.pendingOzon} заказ(ов) ОЗОН — отгрузка заведена непроведённой, платёж НЕ нужен до сборки. Проведите отгрузку и создайте платёж, когда заказ соберут.`);
   }
@@ -2733,6 +2874,7 @@ processBtn.addEventListener('click', async () => {
 
 loadConfig();
 renderPendingOzonOrders();
+renderCancelledOzon();
 renderGiftLosses();
 </script>
 </body>
