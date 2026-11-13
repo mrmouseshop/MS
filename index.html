@@ -334,9 +334,9 @@ function log(msg) {
   let cls = 'l-info';
   if (msg.includes('[OK]')) cls = 'l-ok';
   // [ПРОПУСК] — по просьбе пользователя всегда красным (раньше был серым l-skip и терялся в журнале).
-  else if (msg.includes('[ПРОПУСК]')) cls = 'l-error';
+  else if (msg.includes('[ПРОПУСК]') || msg.includes('НЕ НАЙДЕН (сводно)')) cls = 'l-error';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('ОТМЕНЁННЫЕ ОЗОН') || msg.includes('[ОЗОН ОТМЕНЁН]') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
-           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') ||
+           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') || msg.includes('[ЗАМЕНА') || msg.includes('ЗАМЕНЫ ПО ПОМЕТКАМ') ||
            /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '12.11.2026-1 (отменённые ОЗОН — отдельный блок для проверки)';
+const APP_VERSION = '13.11.2026-1 (ОЗОН: пометки о замене, без неполных отгрузок)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1910,7 +1910,13 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
     // случай 31.10: заказ ещё "Ожидает сборки", кусок не взвешен). Раньше из-за висячей запятой
     // строка не распознавалась вовсе и весь заказ пропускался. Теперь запятая без числа = вес
     // не указан (weightMissing), а что с этим делать — решаем ниже по статусу заказа.
-    const m = line.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*([^,]+?)\s*(,\s*(\d+(?:[.,]\d+)?)?\s*)?$/i);
+    // Пометка в скобках в конце строки: "1 шт, CV_Gudbrandsdalen_TINE_500g_x2 (по факту
+    // отправили 4 шт по 250)" (реальный случай 1.12) — отделяем её от артикула и разбираем ниже.
+    let note = null;
+    const noteM = line.match(/\s*\(([^()]*)\)\s*$/);
+    let lineCore = line;
+    if (noteM && /шт/i.test(line.slice(0, noteM.index))) { note = noteM[1].trim(); lineCore = line.slice(0, noteM.index); }
+    const m = lineCore.match(/^(\d+(?:[.,]\d+)?)\s*шт\.?\s*,\s*([^,]+?)\s*(,\s*(\d+(?:[.,]\d+)?)?\s*)?$/i);
     if (m) {
       const qty = parseFloat(m[1].replace(',', '.'));
       let article = m[2].trim();
@@ -1925,7 +1931,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
         noWeightField = false;
         weightMissing = false;
       }
-      ozonLines.push({ qty: weight !== null ? weight : qty, article, weightMissing, noWeightField });
+      ozonLines.push({ qty: weight !== null ? weight : qty, article, weightMissing, noWeightField, note });
     }
   }
 
@@ -1974,16 +1980,50 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
   }
 
   const newItems = [];
-  for (const { qty, article, weightMissing, noWeightField } of ozonLines) {
+  // Если хоть одну позицию заказа разобрать не удалось — НЕ создаём отгрузку частично (раньше
+  // так и было: 1.12 ушёл только с Бестеморостом, а Гудбрандсдален пропал, и платёж прошёл
+  // по неполной сумме). Весь заказ уходит на ручную проверку.
+  const blockers = [];
+  if (!stats.notFound) stats.notFound = [];
+  if (!stats.ozonNotes) stats.ozonNotes = [];
+  for (const { qty, article, weightMissing, noWeightField, note } of ozonLines) {
     const productData = findProductByArticle(article);
     if (!productData) {
       log(`  [!!!] ВНИМАНИЕ: ОЗОН-товар с артикулом '${article}' не найден в МоемСкладе! Заказ [${header}] — проведите вручную.`);
+      stats.notFound.push({ header, what: `артикул '${article}'` });
+      blockers.push(`артикул '${article}' не найден`);
+      continue;
+    }
+    if (note) {
+      // Поддерживаем пометку о замене: "по факту отправили N шт по 250" — тот же товар в другой
+      // фасовке. Ищем карточку с тем же названием, но другим весом ("…500гр" -> "…250гр").
+      const sub = note.match(/(\d+)\s*шт\.?\s*по\s*(\d+(?:[.,]\d+)?)\s*(кг|гр|г)?/i);
+      let replacement = null;
+      if (sub) {
+        let grams = parseFloat(sub[2].replace(',', '.'));
+        if (sub[3] && sub[3].toLowerCase() === 'кг') grams = Math.round(grams * 1000);
+        const sizeRe = /\d+(?:[.,]\d+)?\s*(?:гр|г|кг)(?![а-яёa-z])/i;
+        if (sizeRe.test(productData.name)) {
+          const wanted = productData.name.replace(sizeRe, `${grams}гр`);
+          const found = findProductMeta(wanted, null);
+          if (found && namesMatchExactly(wanted, found.name)) replacement = { product: found, qty: parseInt(sub[1], 10) };
+        }
+      }
+      if (!replacement) {
+        log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' пометка «${note}» — не понял, что отправлено. Заказ не создаю, проведите вручную.`);
+        blockers.push(`'${article}': пометка «${note}»`);
+        continue;
+      }
+      log(`  [ЗАМЕНА ПО ПОМЕТКЕ] '${article}' («${note}»): в отгрузку идёт ${replacement.qty} × '${replacement.product.name}' вместо '${productData.name}' — проверьте.`);
+      stats.ozonNotes.push({ header, article, note, result: `${replacement.qty} × ${replacement.product.name}` });
+      newItems.push({ quantity: replacement.qty, assortment: { meta: replacement.product.meta }, price: replacement.product.price, _name: replacement.product.name });
       continue;
     }
     if (weightMissing) {
       if (!isPendingStatus) {
         // Заказ уже собран/доставляется, а вес так и не вписан — сколько списывать, неизвестно.
-        log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' не указан вес куска — позицию не отгружаю, проведите вручную.`);
+        log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' не указан вес куска — заказ не создаю, проведите вручную.`);
+        blockers.push(`у '${article}' не указан вес`);
         continue;
       }
       if (looksWeighed(productData.name)) {
@@ -2010,6 +2050,12 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
     }
     log(`  [OZON] Артикул '${article}' найден как '${productData.name}' (Кол-во: ${shipQty})`);
     newItems.push({ quantity: shipQty, assortment: { meta: productData.meta }, price: productData.price, _name: productData.name });
+  }
+
+  if (blockers.length) {
+    log(`  [ПРОПУСК] Заказ ОЗОН [${header}] НЕ создан целиком (чтобы не было неполной отгрузки и платежа): ${blockers.join('; ')} — проведите вручную.`);
+    stats.skippedEmptyOrders.push({ header, reason: blockers.join('; ') });
+    return;
   }
 
   if (!newItems.length) {
@@ -2479,6 +2525,8 @@ async function processReport(reportTextRaw) {
       const productData = findProductMeta(pRaw, weight);
       if (!productData) {
         log(`  [!!!] ВНИМАНИЕ: Товар '${pRaw}' не найден!`);
+        if (!stats.notFound) stats.notFound = [];
+        stats.notFound.push({ header, what: `'${pRaw}'` });
         continue;
       }
       const nameExactMatch = productData.viaManualMap || namesMatchExactly(pRaw, productData.name);
@@ -2752,12 +2800,20 @@ async function processReport(reportTextRaw) {
     // равно причитаются и должны быть проведены вручную. Перечисляем каждую запись отдельно
     // (а не только счётчиком), чтобы было сразу видно, КАКИЕ заказы нужно проверить, без
     // необходимости листать весь журнал заново в их поисках.
-    log(`  ❗ПРОВЕРЬТЕ ВРУЧНУЮ (сводно): ${stats.skippedEmptyOrders.length} запис(ей) без распознанного товара — отгрузка НЕ создана, деньги (если причитаются) проведите вручную:`);
+    log(`  ❗ПРОВЕРЬТЕ ВРУЧНУЮ (сводно): ${stats.skippedEmptyOrders.length} запис(ей) без распознанного товара или с нераспознанной позицией — отгрузка НЕ создана, деньги (если причитаются) проведите вручную:`);
     for (const { header, reason } of stats.skippedEmptyOrders) {
       log(`    - [${header}]: ${reason}`);
     }
   } else {
     log(`  [OK] "Недозаказов"/ДОПЛАТ без распознанного товара за этот запуск не обнаружено.`);
+  }
+  if (stats.notFound && stats.notFound.length) {
+    log(`  ❗ ТОВАР НЕ НАЙДЕН (сводно): ${stats.notFound.length} позици(й) — в МоемСкладе не найдено, проверьте:`);
+    for (const { header, what } of stats.notFound) log(`    - [${header}]: ${what}`);
+  }
+  if (stats.ozonNotes && stats.ozonNotes.length) {
+    log(`  ❗ЗАМЕНЫ ПО ПОМЕТКАМ ОЗОН (сводно): ${stats.ozonNotes.length} — отгружено не то, что в артикуле, проверьте:`);
+    for (const { header, article, note, result } of stats.ozonNotes) log(`    - [${header}]: ${article} («${note}») -> ${result}`);
   }
   if (stats.nameMismatches.length > 0) {
     // Товар НАШЁЛСЯ (в отличие от "[!!!] не найден" выше), но название в каталоге совпало с
@@ -2772,6 +2828,8 @@ async function processReport(reportTextRaw) {
     for (const { reportName, catalogName } of stats.nameMismatches) {
       log(`    - [${reportName}] -> [${catalogName}]`);
     }
+  } else if (stats.notFound && stats.notFound.length) {
+    log(`  Найденные товары совпали с текстом отчёта 1-в-1, но ${stats.notFound.length} позици(й) НЕ НАЙДЕНЫ вовсе — см. «ТОВАР НЕ НАЙДЕН» выше.`);
   } else {
     log(`  [OK] Все найденные товары совпали с текстом отчёта 1-в-1.`);
   }
