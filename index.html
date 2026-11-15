@@ -336,7 +336,7 @@ function log(msg) {
   // [ПРОПУСК] — по просьбе пользователя всегда красным (раньше был серым l-skip и терялся в журнале).
   else if (msg.includes('[ПРОПУСК]') || msg.includes('НЕ НАЙДЕН (сводно)')) cls = 'l-error';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('ОТМЕНЁННЫЕ ОЗОН') || msg.includes('[ОЗОН ОТМЕНЁН]') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
-           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') || msg.includes('[ЗАМЕНА') || msg.includes('ЗАМЕНЫ ПО ПОМЕТКАМ') ||
+           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') || msg.includes('[ЗАМЕНА') || msg.includes('[ДОЛГ/ДОПЛАТА]') || msg.includes('ПРОВЕРЬТЕ КОНТРАГЕНТА') || msg.includes('ЗАМЕНЫ ПО ПОМЕТКАМ') ||
            /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
@@ -554,7 +554,7 @@ function renderCancelledOzon() {
       const ul = document.createElement('ul');
       for (const it of entry.items) {
         const li = document.createElement('li');
-        li.textContent = `${it.qty} × ${it.article}` + (it.name ? ` (${it.name})` : '');
+        li.textContent = `${it.qty} × ${it.article}` + (it.pieces ? ` = ${it.pieces} шт` : '') + (it.name ? ` (${it.name})` : '');
         ul.appendChild(li);
       }
       item.appendChild(ul);
@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '13.11.2026-1 (ОЗОН: пометки о замене, без неполных отгрузок)';
+const APP_VERSION = '15.11.2026-2 (сдача «(2000 сдача 150)», округление итога, проверка контрагента)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -906,6 +906,13 @@ function looksWeighed(name) {
   return true;
 }
 
+// "500 гр" и "500гр" — одно и то же. Склеиваем число с единицей, иначе запрос "Хамон Серрано
+// Nico 500гр" не находил карточку "Хамон Серрано Nico 500 гр" (реальный случай 13.11: слово
+// "500гр" не входит в "500 гр", а для хамона требуется совпадение всех слов).
+function joinSizeUnits(s) {
+  return s.replace(/(\d)\s+(кг|гр|г|мл|л)(?![а-яёА-ЯЁa-zA-Z])/gi, '$1$2');
+}
+
 function namesMatchExactly(reportText, catalogName) {
   // Сворачиваем омоглифы (как и сам нечёткий поиск выше) и убираем чисто косметический "мусор"
   // (висячее тире/точку на конце названия, двойные пробелы) — иначе, например, "Prima Donna
@@ -914,7 +921,7 @@ function namesMatchExactly(reportText, catalogName) {
   // КАЖДЫЙ раз заново — это не ошибка подбора, а чисто текстовый артефакт, который сам поиск
   // уже и так считает одним и тем же товаром. Шум от таких "вечных" срабатываний только прятал
   // бы действительно новые и непроверенные подстановки (как Пармезан ~270гр/~1кг).
-  const norm = s => foldHomoglyphs(s.toLowerCase())
+  const norm = s => foldHomoglyphs(joinSizeUnits(s.toLowerCase()))
     .replace(/\[\s*sale\s*\]/gi, '')
     .replace(/[«»"'„“”]/g, '')
     .replace(/[-–—.,]+\s*$/g, '')
@@ -935,7 +942,7 @@ function findProductMeta(pRaw, weight) {
   // должны найтись в названии каталога. Каталожное название "sale" не содержит, и товар,
   // который иначе совпал бы идеально, тихо не находился вовсе (см. "Хамон Серрано набор
   // подарочный NICO 950гр [SALE]" — реальный товар в базе есть, но не находился).
-  query = query.replace(/\[\s*sale\s*\]/gi, '').trim();
+  query = joinSizeUnits(query.replace(/\[\s*sale\s*\]/gi, '').trim());
 
   // "Нога" — просто уточнение формата отруба ("хамон целой ногой на кости"), которое
   // менеджер иногда добавляет в текст отчёта ("Хамон нога "5J Cinco Jotas»..."), а
@@ -1011,7 +1018,7 @@ function findProductMeta(pRaw, weight) {
 
   for (const fullName in PRODUCTS_CACHE) {
     const data = PRODUCTS_CACHE[fullName];
-    const nameLower = fullName.toLowerCase();
+    const nameLower = joinSizeUnits(fullName.toLowerCase());
     const nameLowerFolded = foldHomoglyphs(nameLower);
     const matches = queryWordsFolded.filter(w => nameLowerFolded.includes(w)).length;
     const isHamon = query.includes('хамон');
@@ -1350,6 +1357,13 @@ async function appendCounterpartyAlias(row, reportName) {
     .join(' ');
   const aliasCore = nameCore(alias);
   if (counterpartyNameParts(row.name).some(part => nameCore(part) === aliasCore)) return;
+  // Все слова нового имени уже есть в одной из частей ("Николай ави" при "Анна Николай ави",
+  // "Сорокин Денис Валерьевич воц" при "Сорокин Денис Валерьевич DS тг") — дописывать нечего.
+  const aliasTokens = aliasCore.split(' ');
+  if (counterpartyNameParts(row.name).some(part => {
+    const partTokens = nameCore(part).split(' ');
+    return aliasTokens.every(t => partTokens.includes(t));
+  })) return;
   const newName = `${(row.name || '').trim()} | ${alias}`;
   if (newName.length > 255) {
     log(`  [ПРЕДУПРЕЖДЕНИЕ] Имя контрагента '${row.name}' слишком длинное, чтобы дописать '${alias}' — оставляю как есть.`);
@@ -1397,6 +1411,15 @@ async function getOrCreateCounterparty(name, phone) {
       // см. appendCounterpartyAlias) — совпадение с ЛЮБОЙ частью тоже считается точным.
       if (counterpartyNameParts(row.name).includes(normCpName(name))) {
         log(`  [Контрагент] Найден по точному ИМЕНИ: ${row.name}`);
+        // По телефону не нашёлся, а по имени нашёлся: у частых имён ("Светлана тг") это может
+        // быть ДРУГОЙ человек. Если в карточке записан другой номер — показываем это явно.
+        if (cleanPhone.length >= 10) {
+          const rowDigits = (row.phone || '').replace(/\D/g, '');
+          if (rowDigits.length >= 10 && !rowDigits.includes(cleanPhone.slice(-10))) {
+            log(`  [ПРОВЕРЬТЕ КОНТРАГЕНТА] '${name}': телефон в отчёте ${phone}, а в карточке «${row.name}» записан ${row.phone} — возможно, это другой клиент с тем же именем.`);
+            CP_PHONE_WARNINGS.push({ name, reportPhone: phone, cpName: row.name, cpPhone: row.phone });
+          }
+        }
         return row.id;
       }
     }
@@ -1494,6 +1517,12 @@ async function paymentAlreadyExists(cId, dateStr, descText) {
 
 /* ===================== ИТОГО ИЗ ТЕКСТА ЗАКАЗА ===================== */
 
+// "Итого" последнего разобранного заказа как оно написано в отчёте (до вычета доставки и пр.) —
+// нужно, чтобы отличить "клиент заплатил круглую сумму" от настоящей несостыковки.
+let LAST_REPORT_ITOGO_RUB = null;
+// Контрагент найден по имени, а телефон в отчёте другой — копится за прогон для сводки.
+let CP_PHONE_WARNINGS = [];
+
 function extractReportTotalKopecks(blockText) {
   // Приоритет: строка "Суммарный итог" — она встречается, когда один клиент
   // фактически сделал НЕСКОЛЬКО под-заказов под одним заголовком (каждый со своим
@@ -1532,14 +1561,28 @@ function extractReportTotalKopecks(blockText) {
     // Единица — "р", "руб", "рубля", "рублей" ("(100 рублей сдача)", 03.11 заказ 4): раньше
     // "рублей" не проходило, сдача не вычиталась, и вылезала ложная "НЕСОСТЫКОВКА" на её сумму.
     const carryoverRegex = /\(\s*(\d+(?:[.,]\d+)?)\s*(?:р(?:уб[а-яё]*)?|₽)?\.?\s*(?:к\s+след[а-яё]*\s+заказ[а-яё]*|переплат[а-яё]*|сдач[а-яё]*(?:\s+\S+)*)\s*\)/gi;
-    let cm;
-    while ((cm = carryoverRegex.exec(tailRaw)) !== null) {
-      carryoverRub += parseFloat(cm[1].replace(',', '.'));
-    }
     const tail = tailRaw.replace(/\([^)]*\)/g, ' ');
     const nums = tail.match(/\d+(?:[.,]\d+)?/g);
     if (!nums || !nums.length) return null;
-    return parseFloat(nums[nums.length - 1].replace(',', '.')) - carryoverRub;
+    const totalRub = parseFloat(nums[nums.length - 1].replace(',', '.'));
+    // "(2000 сдача 150 Я)" — ДВА числа: клиент дал 2000, сдача 150 (14.11, заказ 8: "Итого: 1850₽
+    // (2000 сдача 150 Я)"). Раньше первое число (2000) принималось за сдачу, и "Итого" выходило
+    // отрицательным. Если "Итого" равно тому, что дал клиент, — вычитаем сдачу; если оно уже
+    // записано за вычетом сдачи (1850 = 2000 − 150) — не вычитаем ничего.
+    const gaveChangeRegex = /^\(\s*(\d+(?:[.,]\d+)?)\s*(?:р(?:уб[а-яё]*)?|₽)?\.?\s*сдач[а-яё]*\s*(\d+(?:[.,]\d+)?)\s*(?:р(?:уб[а-яё]*)?|₽)?\.?(?:\s+\S+)*\s*\)$/i;
+    for (const group of (tailRaw.match(/\([^)]*\)/g) || [])) {
+      const gc = group.match(gaveChangeRegex);
+      if (gc) {
+        const gave = parseFloat(gc[1].replace(',', '.'));
+        const change = parseFloat(gc[2].replace(',', '.'));
+        if (Math.abs(totalRub - gave) < 0.5) carryoverRub += change;
+        continue;
+      }
+      carryoverRegex.lastIndex = 0;
+      const cm = carryoverRegex.exec(group);
+      if (cm) carryoverRub += parseFloat(cm[1].replace(',', '.'));
+    }
+    return totalRub - carryoverRub;
   }
 
   // Приоритет 1: "Суммарный итог" / "Итого суммарно" (порядок слов может быть любым) —
@@ -1677,10 +1720,12 @@ function extractReportTotalKopecks(blockText) {
   // прошлому заказу: эти деньги входят в "Итого", но к товарам этого заказа не относятся.
   // Без вычета сумма позиций расходилась с "Итого" больше допуска, и платёж не создавался.
   let doplataRub = 0;
-  const doplataRegex = /(?:^|\n)\s*\+\s*(\d+(?:[.,]\d+)?)\s*(?:₽|р\.?|руб[а-яё]*\.?)?\s*(?:к\s+)?доплат[а-яё]*/gi;
+  // То же самое — "+64₽ долг" (13.11, заказ 10).
+  const doplataRegex = /(?:^|\n)\s*\+\s*(\d+(?:[.,]\d+)?)\s*(?:₽|р\.?|руб[а-яё]*\.?)?\s*(?:(?:к\s+)?доплат|долг)[а-яё]*/gi;
   let dm;
   while ((dm = doplataRegex.exec(blockText)) !== null) doplataRub += parseFloat(dm[1].replace(',', '.'));
 
+  LAST_REPORT_ITOGO_RUB = itogoRub;
   const goodsRub = itogoRub - deliveryRub - junkRub - doplataRub;
   return pyRound(goodsRub * 100);
 }
@@ -1948,7 +1993,10 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
   const registerCancelled = (demandId) => {
     const items = ozonLines.map(({ qty, article }) => {
       const pd = findProductByArticle(article);
-      return { qty, article, name: pd ? pd.name : '' };
+      // Для наборов "_xN" показываем и реальное число штук ("2 × …_x4 (= 8 шт)").
+      const sm = article.match(/_x(\d{1,2})$/i);
+      const mult = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()] || (sm ? parseInt(sm[1], 10) : 1);
+      return { qty, article, name: pd ? pd.name : '', pieces: mult > 1 ? qty * mult : null };
     });
     if (!stats.cancelledOzon) stats.cancelledOzon = [];
     stats.cancelledOzon.push({ header, posting: cpRaw, items });
@@ -2157,6 +2205,7 @@ async function processReport(reportTextRaw) {
   // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
   // несостыковок/непроведённых платежей вручную.
   const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] };
+  CP_PHONE_WARNINGS = [];
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
@@ -2286,6 +2335,13 @@ async function processReport(reportTextRaw) {
       // есть слово вроде "презент"/"подарок" — попадает под isItem/isGift и даёт ложное
       // "[!!!] ВНИМАНИЕ: Товар '...' не найден!".
       if (STATUS_LINE_REGEX.test(line.trim())) continue;
+      // "+64₽ долг" / "+134 к доплате" — клиент заодно вернул долг по прошлому заказу. Это не
+      // товар (раньше "+64₽ долг" давал ложное "Товар не найден"), сумма вычитается при сверке.
+      const debtM = line.trim().match(/^\+\s*(\d+(?:[.,]\d+)?)\s*(?:₽|р\.?|руб[а-яё]*\.?)?\s*(?:(?:к\s+)?доплат|долг)[а-яё]*/i);
+      if (debtM) {
+        log(`  [ДОЛГ/ДОПЛАТА] '${line.trim()}' — ${debtM[1]} ₽ входят в «Итого», но к товарам этого заказа не относятся: в отгрузку и платёж НЕ включены, проведите их отдельно, если нужно.`);
+        continue;
+      }
       const isItem = /^\d+[)\.]\s+/.test(line) || (
         /(\d+\s*(?:₽|руб)|\s+[-–—]\s*\d+\s*$|🎁|подарок|презент|\s+[-–—=]\s*0\s*(?:₽|руб)?\s*$)/.test(line) &&
         !['итого', 'подытог', 'доставк', 'скидка', 'выручка', 'оплат', 'промокод'].some(x => lineLower.includes(x))
@@ -2689,7 +2745,18 @@ async function processReport(reportTextRaw) {
               // Отчёт округляет каждую весовую позицию до рубля, поэтому расхождение до 50 коп. на
               // позицию — это просто округление (10.11: 5 заказов с разницей 0.30–1.50 ₽), не шумим.
               const roundingKop = 50 * Math.max(1, itemsSell.length) + 1;
-              const hasMismatch = Math.abs(diffKop) > roundingKop;
+              // Клиент заплатил круглую сумму (Итого кратно 50 ₽, разница до 50 ₽) — это округление
+              // итога, а не ошибка (13.11: 7 таких заказов прятали одну настоящую несостыковку).
+              const itogoRaw = LAST_REPORT_ITOGO_RUB;
+              const isTotalRounding = Math.abs(diffKop) > roundingKop && Math.abs(diffKop) <= 5000 &&
+                itogoRaw !== null && Math.abs(itogoRaw / 50 - Math.round(itogoRaw / 50)) < 1e-9;
+              const hasMismatch = Math.abs(diffKop) > roundingKop && !isTotalRounding;
+              if (isTotalRounding) {
+                const sign = diffKop >= 0 ? '+' : '';
+                log(`  [округление итога] Заказ [${header}] (${name}): клиент заплатил круглую сумму — по позициям ${(calculatedKop / 100).toFixed(2)} ₽, в отчёте ${(reportKop / 100).toFixed(2)} ₽ (разница ${sign}${(diffKop / 100).toFixed(2)} ₽).`);
+                stats.roundingOrders = (stats.roundingOrders || 0) + 1;
+                stats.roundingKop = (stats.roundingKop || 0) + Math.abs(diffKop);
+              }
 
               if (hasMismatch) {
                 const sign = diffKop >= 0 ? '+' : '';
@@ -2765,6 +2832,13 @@ async function processReport(reportTextRaw) {
   // что и обычные детальные строки того же смысла — без добавления новых CSS-классов.
   log('');
   log('=== ИТОГИ ЗАПУСКА ===');
+  if (stats.roundingOrders > 0) {
+    log(`  Округление итога (сводно): ${stats.roundingOrders} заказ(ов), суммарно ${(stats.roundingKop / 100).toFixed(2)} ₽ — клиент заплатил круглую сумму, это не ошибка.`);
+  }
+  if (CP_PHONE_WARNINGS.length) {
+    log(`  ❗ПРОВЕРЬТЕ КОНТРАГЕНТА (сводно): ${CP_PHONE_WARNINGS.length} заказ(ов) привязаны к контрагенту по ИМЕНИ, хотя телефон в отчёте другой — возможно, это разные люди:`);
+    for (const w of CP_PHONE_WARNINGS) log(`    - [${w.name}]: в отчёте ${w.reportPhone}, в карточке «${w.cpName}» — ${w.cpPhone}`);
+  }
   if (stats.mismatchOrders > 0) {
     log(`  ❗ НЕСОСТЫКОВКА (сводно): ${stats.mismatchOrders} заказ(ов) с расхождением суммы, итого на ${(stats.mismatchKop / 100).toFixed(2)} ₽ — см. отмеченные заказы выше.`);
   } else {
@@ -2778,7 +2852,7 @@ async function processReport(reportTextRaw) {
   if (stats.cancelledOzon && stats.cancelledOzon.length) {
     log(`  ❌ ОТМЕНЁННЫЕ ОЗОН (сводно): ${stats.cancelledOzon.length} заказ(ов) — товар НЕ списан. Проверьте, не уехал ли он со склада (отмена в день передачи в доставку), иначе при возврате будет «лишний» приход и недостача:`);
     for (const c of stats.cancelledOzon) {
-      const what = c.items.map(it => `${it.qty} × ${it.article}`).join(', ') || 'товар не указан';
+      const what = c.items.map(it => `${it.qty} × ${it.article}` + (it.pieces ? ` (= ${it.pieces} шт)` : '')).join(', ') || 'товар не указан';
       log(`    - [${c.header}] ${c.posting}: ${what}`);
     }
   }
