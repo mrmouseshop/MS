@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '18.11.2026-2 (новый контрагент при несовпадении телефонов)';
+const APP_VERSION = '18.11.2026-3 (общий итог нескольких подзаказов)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1524,10 +1524,7 @@ let LAST_REPORT_ITOGO_RUB = null;
 let CP_PHONE_CONFLICTS = [];
 
 function extractReportTotalKopecks(blockText) {
-  // Приоритет: строка "Суммарный итог" — она встречается, когда один клиент
-  // фактически сделал НЕСКОЛЬКО под-заказов под одним заголовком (каждый со своим
-  // "Итого:"), и в конце менеджер подводит ОБЩИЙ итог. Если её нет — берём первую
-  // обычную строку "Итого:" (как раньше).
+  // Явный общий итог одного блока применяется ко всем подзаказам.
   // ВАЖНО: без проверки границы слова "итого" может случайно найтись ВНУТРИ другого
   // слова — например, в адресе "Магнитогорская улица 3" буквы "нитог" внутри слова
   // складываются ровно в "итого"! Тогда регэксп подхватывает мусор из адреса вместо
@@ -1598,6 +1595,20 @@ function extractReportTotalKopecks(blockText) {
   const mSum = blockText.match(new RegExp(NOT_LETTER_BEFORE + '(?:суммарный\\s+итог[а-яё]*|итог[а-яё]*\\s+суммарно)' + NOT_LETTER_AFTER + '\\s*:?\\s*(.+)', 'i'));
   if (mSum) itogoRub = extractOneTotalRub(mSum[1]);
 
+  const blockLines = blockText.split('\n');
+  const combinedPaymentLabel = /^итого\s+за\s+об[ае]\s+оплатил[аи]?(?=\s|:|$)\s*:?\s*/i;
+  if (itogoRub === null) {
+    // «Итого за оба оплатил: 21100 Климу на втб» — общий итог блока из отчёта 18.11.
+    for (const rawLine of blockLines) {
+      const line = rawLine.trim();
+      const label = line.match(combinedPaymentLabel);
+      if (!label) continue;
+      const amount = line.slice(label[0].length)
+        .match(/^(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)([.,]\d+)?(?=$|[\s₽р(])/i);
+      if (amount) itogoRub = Number(amount[1].replace(/\s/g, '') + (amount[2] || '').replace(',', '.'));
+    }
+  }
+
   if (itogoRub === null) {
     // Приоритет 2: обычные строки "Итого:" — если "Суммарный итог"/"Итого суммарно" нет,
     // но при этом строк "Итого:" НЕСКОЛЬКО (несколько под-заказов под одним клиентом без
@@ -1610,7 +1621,6 @@ function extractReportTotalKopecks(blockText) {
     // "Итого:" учитывается в сумме только если ДО неё в блоке уже встретилась хотя бы одна
     // пронумерованная строка товара ("1. ...", "2) ..." и т.п.) — то есть это итог уже
     // ПОСЛЕ перечисления товаров, а не предварительный анонс суммы.
-    const blockLines = blockText.split('\n');
     const itemLineRegex = /^\s*\d+[)\.]\s+/;
     const itogoLineOnlyRegex = new RegExp(NOT_LETTER_BEFORE + 'итого' + NOT_LETTER_AFTER + '\\s*:?\\s*(.+)', 'i');
     // Две строки "Итого:" ПОДРЯД, без товаров между ними ("Итого: 4440₽" / "Итого: 4450 ₽",
@@ -1623,7 +1633,7 @@ function extractReportTotalKopecks(blockText) {
     let count = 0;
     for (const rawLine of blockLines) {
       if (itemLineRegex.test(rawLine)) { seenItemLine = true; itemsSinceLastItogo = true; continue; }
-      if (!seenItemLine) continue;
+      if (!seenItemLine || combinedPaymentLabel.test(rawLine.trim())) continue;
       const im = rawLine.match(itogoLineOnlyRegex);
       if (im) {
         const val = extractOneTotalRub(im[1]);
