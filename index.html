@@ -336,7 +336,7 @@ function log(msg) {
   // [ПРОПУСК] — по просьбе пользователя всегда красным (раньше был серым l-skip и терялся в журнале).
   else if (msg.includes('[ПРОПУСК]') || msg.includes('НЕ НАЙДЕН (сводно)')) cls = 'l-error';
   else if (msg.includes('❗ПРОВЕРЬТЕ ЦЕНУ') || msg.includes('ОТМЕНЁННЫЕ ОЗОН') || msg.includes('[ОЗОН ОТМЕНЁН]') || msg.includes('[ПРЕДУПРЕЖДЕНИЕ]') || msg.includes('ПЛАТЁЖ НЕ СОЗДАН') ||
-           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') || msg.includes('[ЗАМЕНА') || msg.includes('[ДОЛГ/ДОПЛАТА]') || msg.includes('ПРОВЕРЬТЕ КОНТРАГЕНТА') || msg.includes('ЗАМЕНЫ ПО ПОМЕТКАМ') ||
+           msg.includes('ПРОВЕРЬТЕ ВРУЧНУЮ') || msg.includes('ПРОВЕРЬТЕ НАЗВАНИЕ') || msg.includes('[ЗАМЕНА') || msg.includes('[ДОЛГ/ДОПЛАТА]') || msg.includes('ЗАМЕНЫ ПО ПОМЕТКАМ') ||
            /^\s*- \[.*\]:/.test(msg) || /^\s*- \[.*\]\s*->\s*\[.*\]/.test(msg)) cls = 'l-warn';
   else if (msg.includes('[!!!]') || msg.includes('ОШИБКА') || msg.includes('НЕСОСТЫКОВКА')) cls = 'l-error';
   else if (msg.includes('СКИДКА')) cls = 'l-discount';
@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '18.11.2026-1 (телефоны контрагентов, записи о доставке, сверка ОЗОН)';
+const APP_VERSION = '18.11.2026-2 (новый контрагент при несовпадении телефонов)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1409,42 +1409,39 @@ async function getOrCreateCounterparty(name, phone) {
     }
   }
 
-  let resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(name)), { headers: msHeaders() });
+  let conflict;
+  const resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(name)), { headers: msHeaders() });
   if (resp.ok) {
     const data = await resp.json();
     const nameKey = normCpName(name);
     const sameName = (data.rows || []).filter(row => counterpartyNameParts(row.name).includes(nameKey));
     const samePhone = phoneKey && sameName.find(row => counterpartyPhoneKeys(row.phone).includes(phoneKey));
-    const conflict = phoneKey && !samePhone && sameName.find(row => counterpartyPhoneKeys(row.phone).length);
-    if (conflict) {
-      log(`  [ПРОВЕРЬТЕ КОНТРАГЕНТА] '${name}': телефон в отчёте ${phone}, в карточке «${conflict.name}» — ${conflict.phone}. Отгрузка и платёж пропущены до сверки.`);
-      CP_PHONE_WARNINGS.push({ name, reportPhone: phone, cpName: conflict.name, cpPhone: conflict.phone });
-      return null;
-    }
-    const match = samePhone || sameName[0];
+    conflict = phoneKey && !samePhone && sameName.find(row => counterpartyPhoneKeys(row.phone).length);
+    const match = samePhone || (!conflict && sameName[0]);
     if (match) {
       log(`  [Контрагент] Найден по точному ИМЕНИ: ${match.name}`);
       return match.id;
     }
   }
 
+  let id;
   if (DRY_RUN) {
-    log(`  [Контрагент] СОЗДАН НОВЫЙ${drSuffix()}: ${name} (Телефон: ${phone})`);
-    return 'dryrun-cp-' + Math.random().toString(36).slice(2, 10);
-  }
-
-  const newCp = { name: name };
-  if (phone) newCp.phone = phone;
-
-  resp = await msFetch(apiUrl('/entity/counterparty'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(newCp) });
-  if (resp.status === 200 || resp.status === 201) {
-    const data = await resp.json();
-    log(`  [Контрагент] СОЗДАН НОВЫЙ: ${name} (Телефон: ${phone})`);
-    return data.id;
+    id = 'dryrun-cp-' + Math.random().toString(36).slice(2, 10);
   } else {
-    log(`  [ОШИБКА API] Не удалось создать контрагента '${name}'. ${await resp.text()}`);
-    return null;
+    const newCp = { name };
+    if (phone) newCp.phone = phone;
+    const created = await msFetch(apiUrl('/entity/counterparty'), { method: 'POST', headers: msHeaders(), body: JSON.stringify(newCp) });
+    if (created.status !== 200 && created.status !== 201) {
+      log(`  [ОШИБКА API] Не удалось создать контрагента '${name}'. ${await created.text()}`);
+      return null;
+    }
+    const data = await created.json();
+    id = data.id;
   }
+  const reason = conflict ? ` — у одноимённой карточки «${conflict.name}» другой телефон (${conflict.phone})` : '';
+  log(`  [Контрагент] СОЗДАН НОВЫЙ${drSuffix()}: ${name} (Телефон: ${phone})${reason}`);
+  if (conflict) CP_PHONE_CONFLICTS.push({ name, reportPhone: phone, cpName: conflict.name, cpPhone: conflict.phone });
+  return id;
 }
 
 /* ===================== ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА ===================== */
@@ -1524,7 +1521,7 @@ async function paymentAlreadyExists(cId, dateStr, descText) {
 // нужно, чтобы отличить "клиент заплатил круглую сумму" от настоящей несостыковки.
 let LAST_REPORT_ITOGO_RUB = null;
 // Контрагент найден по имени, а телефон в отчёте другой — копится за прогон для сводки.
-let CP_PHONE_WARNINGS = [];
+let CP_PHONE_CONFLICTS = [];
 
 function extractReportTotalKopecks(blockText) {
   // Приоритет: строка "Суммарный итог" — она встречается, когда один клиент
@@ -2224,7 +2221,7 @@ async function processReport(reportTextRaw) {
   // несостыковок/непроведённых платежей вручную.
   const stats = { mismatchKop: 0, mismatchOrders: 0, createdPayments: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [], ozonAmountDifferences: [] };
   const deliveryNotes = [];
-  CP_PHONE_WARNINGS = [];
+  CP_PHONE_CONFLICTS = [];
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
@@ -2863,9 +2860,11 @@ async function processReport(reportTextRaw) {
   if (stats.roundingOrders > 0) {
     log(`  Округление итога (сводно): ${stats.roundingOrders} заказ(ов), суммарно ${(stats.roundingKop / 100).toFixed(2)} ₽ — клиент заплатил круглую сумму, это не ошибка.`);
   }
-  if (CP_PHONE_WARNINGS.length) {
-    log(`  ❗ПРОВЕРЬТЕ КОНТРАГЕНТА (сводно): ${CP_PHONE_WARNINGS.length} заказ(ов) пропущено из-за несовпадения телефонов у одноимённых контрагентов:`);
-    for (const w of CP_PHONE_WARNINGS) log(`    - [${w.name}]: в отчёте ${w.reportPhone}, в карточке «${w.cpName}» — ${w.cpPhone}`);
+  if (CP_PHONE_CONFLICTS.length) {
+    log(`  Новые одноимённые контрагенты ${DRY_RUN ? 'в тестовом прогоне' : 'созданы'}: ${CP_PHONE_CONFLICTS.length}.`);
+    for (const { name, reportPhone, cpName, cpPhone } of CP_PHONE_CONFLICTS) {
+      log(`    - [${name}]: телефон новой карточки ${reportPhone}, в существующей карточке «${cpName}» — ${cpPhone}`);
+    }
   }
   if (stats.mismatchOrders > 0) {
     log(`  ❗ НЕСОСТЫКОВКА (сводно): ${stats.mismatchOrders} заказ(ов) с расхождением суммы, итого на ${(stats.mismatchKop / 100).toFixed(2)} ₽ — см. отмеченные заказы выше.`);
