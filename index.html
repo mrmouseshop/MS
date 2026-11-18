@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '15.11.2026-2 (сдача «(2000 сдача 150)», округление итога, проверка контрагента)';
+const APP_VERSION = '18.11.2026-1 (телефоны контрагентов, записи о доставке, сверка ОЗОН)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1313,13 +1313,20 @@ function reportPriceMismatch(productName, textPriceKop, catalogPriceKop, stats) 
 /* ===================== ТЕЛЕФОН / КОНТРАГЕНТ ===================== */
 
 function findPhone(text) {
-  const match = text.match(/(?:\+7|8)(?:[\s\-\(\)‑–—]*\d){10}/);
+  const match = text.match(/(?<!\d)(?:\+7|8)(?:(?:[^\S\r\n]|[()\-‑–—])*\d){10}(?!\d)/);
   if (match) {
     let cleanPhone = match[0].replace(/\D/g, '');
     if (cleanPhone.startsWith('8')) cleanPhone = '7' + cleanPhone.slice(1);
     return '+' + cleanPhone;
   }
-  return '';
+  const standalone = text.split('\n').map(line => line.trim()).find(line => /^9\d{9}$/.test(line));
+  return standalone ? '+7' + standalone : '';
+}
+
+function counterpartyPhoneKeys(value) {
+  return (value || '').split(/[,;/\n]+/).map(part => part.replace(/\D/g, ''))
+    .filter(digits => /^(?:[78])?\d{10}$/.test(digits))
+    .map(digits => digits.slice(-10));
 }
 
 function normCpName(s) {
@@ -1387,18 +1394,17 @@ async function appendCounterpartyAlias(row, reportName) {
 }
 
 async function getOrCreateCounterparty(name, phone) {
-  const cleanPhone = phone ? phone.replace(/\D/g, '') : '';
+  const phoneKey = counterpartyPhoneKeys(phone)[0];
 
-  if (cleanPhone && cleanPhone.length >= 10) {
-    const searchPhone = cleanPhone.slice(-10);
-    const resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(searchPhone)), { headers: msHeaders() });
+  if (phoneKey) {
+    const resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(phoneKey)), { headers: msHeaders() });
     if (resp.ok) {
       const data = await resp.json();
-      const rows = data.rows || [];
-      if (rows.length) {
-        log(`  [Контрагент] Найден по ТЕЛЕФОНУ: ${rows[0].name} (ID: ${rows[0].id})`);
-        await appendCounterpartyAlias(rows[0], name);
-        return rows[0].id;
+      const match = (data.rows || []).find(row => counterpartyPhoneKeys(row.phone).includes(phoneKey));
+      if (match) {
+        log(`  [Контрагент] Найден по ТЕЛЕФОНУ: ${match.name} (ID: ${match.id})`);
+        await appendCounterpartyAlias(match, name);
+        return match.id;
       }
     }
   }
@@ -1406,22 +1412,19 @@ async function getOrCreateCounterparty(name, phone) {
   let resp = await msFetch(apiUrl('/entity/counterparty?search=' + encodeURIComponent(name)), { headers: msHeaders() });
   if (resp.ok) {
     const data = await resp.json();
-    for (const row of (data.rows || [])) {
-      // Имя контрагента может быть "склеенным" из нескольких ("Виктория ави | Kris Taada т" —
-      // см. appendCounterpartyAlias) — совпадение с ЛЮБОЙ частью тоже считается точным.
-      if (counterpartyNameParts(row.name).includes(normCpName(name))) {
-        log(`  [Контрагент] Найден по точному ИМЕНИ: ${row.name}`);
-        // По телефону не нашёлся, а по имени нашёлся: у частых имён ("Светлана тг") это может
-        // быть ДРУГОЙ человек. Если в карточке записан другой номер — показываем это явно.
-        if (cleanPhone.length >= 10) {
-          const rowDigits = (row.phone || '').replace(/\D/g, '');
-          if (rowDigits.length >= 10 && !rowDigits.includes(cleanPhone.slice(-10))) {
-            log(`  [ПРОВЕРЬТЕ КОНТРАГЕНТА] '${name}': телефон в отчёте ${phone}, а в карточке «${row.name}» записан ${row.phone} — возможно, это другой клиент с тем же именем.`);
-            CP_PHONE_WARNINGS.push({ name, reportPhone: phone, cpName: row.name, cpPhone: row.phone });
-          }
-        }
-        return row.id;
-      }
+    const nameKey = normCpName(name);
+    const sameName = (data.rows || []).filter(row => counterpartyNameParts(row.name).includes(nameKey));
+    const samePhone = phoneKey && sameName.find(row => counterpartyPhoneKeys(row.phone).includes(phoneKey));
+    const conflict = phoneKey && !samePhone && sameName.find(row => counterpartyPhoneKeys(row.phone).length);
+    if (conflict) {
+      log(`  [ПРОВЕРЬТЕ КОНТРАГЕНТА] '${name}': телефон в отчёте ${phone}, в карточке «${conflict.name}» — ${conflict.phone}. Отгрузка и платёж пропущены до сверки.`);
+      CP_PHONE_WARNINGS.push({ name, reportPhone: phone, cpName: conflict.name, cpPhone: conflict.phone });
+      return null;
+    }
+    const match = samePhone || sameName[0];
+    if (match) {
+      log(`  [Контрагент] Найден по точному ИМЕНИ: ${match.name}`);
+      return match.id;
     }
   }
 
@@ -1913,7 +1916,20 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_pecorino_romano_quattrocolli_200g_x2': 2,
 };
 
-async function processMarketplaceOrder(header, block, lines, reportDate, stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] }) {
+function extractOzonReportAmount(lines) {
+  const amounts = [];
+  for (const line of lines) {
+    const match = line.match(/^(?:итого\s*:?\s*)?(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)([.,]\d{1,2})?\s*(?:₽|руб\.?|р\.?)$/i);
+    if (match) {
+      const rub = Number(match[1].replace(/\s/g, '') + (match[2] || '').replace(',', '.'));
+      const kopecks = pyRound(rub * 100);
+      if (Number.isSafeInteger(kopecks)) amounts.push(kopecks);
+    }
+  }
+  return amounts.length === 1 ? amounts[0] : null;
+}
+
+async function processMarketplaceOrder(header, block, lines, reportDate, stats) {
   const cpRaw = lines[0] || 'OZON';
   const fullDesc = `${header}\n${block.trim()}`;
 
@@ -2138,19 +2154,21 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats =
 
   log(`  => Отгрузка ОЗОН [${header}] (${cpRaw}) успешно создана!${drSuffix()}`);
 
-  // ВАЖНО: для заказов ОЗОН сумму/"Итого", написанную в самом отчёте, ИГНОРИРУЕМ
-  // полностью — она отражает розничную цену маркетплейса, а не то, что реально должно
-  // списаться в МоемСкладе. Отгружаем и проводим платёж строго по каталожной цене товара
-  // (как уже стоит в позициях newItems выше) — то есть "как есть в МоемСкладе", без
-  // подгонки суммы под число из отчёта.
+  // Сумма из отчёта ОЗОН показывается для сверки. Платёж привязан к сумме отгрузки по каталогу.
   const itemsSum = pyRound(newItems.reduce((s, it) => s + it.quantity * it.price, 0));
   const paymentSum = demandResult.sum !== undefined ? demandResult.sum : itemsSum;
+  const reportSum = extractOzonReportAmount(lines);
+  if (reportSum !== null && reportSum !== paymentSum) {
+    log(`  [СВЕРКА ОЗОН] [${header}] (${cpRaw}): сумма в отчёте ${(reportSum / 100).toFixed(2)} ₽, платёж по сумме отгрузки ${(paymentSum / 100).toFixed(2)} ₽.`);
+    stats.ozonAmountDifferences.push({ reportSum, paymentSum });
+  }
 
   if (await paymentAlreadyExists(cId, reportDate, fullDesc)) {
     log(`  [ПРОПУСК] Входящий платёж ОЗОН для [${header}] уже есть в МоемСкладе — дубль не создаю.`);
     return;
   }
   if (await createPaymentIn(cId, demandResult.meta, paymentSum, reportDate, fullDesc)) {
+    stats.createdPayments++;
     log(`  => 💰 Входящий платёж ОЗОН на ${(paymentSum / 100).toFixed(2)} ₽ для [${header}] создан.${drSuffix()}`);
   } else {
     log(`  [ОШИБКА API] МойСклад не смог создать платёж ОЗОН для [${header}].`);
@@ -2199,22 +2217,31 @@ async function processReport(reportTextRaw) {
     orders.push([header, body]);
   }
 
-  log(`Дата отгрузок: ${reportDate}. Найдено заказов: ${orders.length}`);
+  log(`Дата отгрузок: ${reportDate}. Найдено блоков: ${orders.length}`);
 
   // Сводная статистика по всему запуску — печатается коротким блоком в самом конце
   // (см. итоговый вывод перед 'Готово.'), чтобы не листать весь длинный журнал в поисках
   // несостыковок/непроведённых платежей вручную.
-  const stats = { mismatchKop: 0, mismatchOrders: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [] };
+  const stats = { mismatchKop: 0, mismatchOrders: 0, createdPayments: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [], ozonAmountDifferences: [] };
+  const deliveryNotes = [];
   CP_PHONE_WARNINGS = [];
 
   for (const [header, block] of orders) {
     const lines = mergeParentheticalContinuations(block.trim().split('\n').map(l => l.trim()).filter(l => l));
     if (!lines.length) continue;
 
+    if (/^0\.\d+$/.test(header) && /^(?:доставка\s+заказа|переоформлена\s+доставка)(?=\s|$)/i.test(lines[0]) &&
+        lines.slice(1).every(line => /^(?:(?:доставка|итого)\s*:|[_—-]+$)/i.test(line))) {
+      const total = lines.find(line => /^итого\s*:/i.test(line));
+      deliveryNotes.push({ header, description: lines[0], total });
+      log(`  [ДОСТАВКА] [${header}] ${lines[0]}${total ? ` (${total})` : ''}.`);
+      continue;
+    }
+
     // --- ЗАКАЗЫ МАРКЕТПЛЕЙСОВ (ОЗОН и т.п.) ---
     // Формат совсем другой: нет имени клиента (только номер заказа маркетплейса,
     // используем его же как контрагента), товар ищем по АРТИКУЛУ (не по названию),
-    // а цену/сумму из отчёта не проверяем — просто проводим платёж на неё.
+    // сумму из отчёта выводим для сверки, платёж рассчитываем по отгрузке.
     //
     // ВАЖНО: заголовок настоящего заказа маркетплейса ВСЕГДА имеет вид "N.N ОЗОН..."
     // (под-номер через точку сразу перед словом "ОЗОН" — см. регэксп разбивки на заказы
@@ -2773,6 +2800,7 @@ async function processReport(reportTextRaw) {
                 if (await paymentAlreadyExists(cId, reportDate, paymentDesc)) {
                   log(`  [ПРОПУСК] Входящий платёж для [${header}] (${name}) уже есть в МоемСкладе — дубль не создаю.`);
                 } else if (await createPaymentIn(cId, demandResult.meta, paymentSum, reportDate, paymentDesc)) {
+                  stats.createdPayments++;
                   log(`  => 💰 Входящий платёж на ${(paymentSum / 100).toFixed(2)} ₽ для [${header}] (${name}) создан` +
                       `${hasMismatch ? ' (в пределах допустимой погрешности — см. уведомление выше)' : (Math.abs(diffKop) > 1 ? ' (сумма позиций совпала с отчётом с точностью до округления)' : ' (сумма позиций совпала с отчётом)')}.${drSuffix()}`);
                 } else {
@@ -2836,7 +2864,7 @@ async function processReport(reportTextRaw) {
     log(`  Округление итога (сводно): ${stats.roundingOrders} заказ(ов), суммарно ${(stats.roundingKop / 100).toFixed(2)} ₽ — клиент заплатил круглую сумму, это не ошибка.`);
   }
   if (CP_PHONE_WARNINGS.length) {
-    log(`  ❗ПРОВЕРЬТЕ КОНТРАГЕНТА (сводно): ${CP_PHONE_WARNINGS.length} заказ(ов) привязаны к контрагенту по ИМЕНИ, хотя телефон в отчёте другой — возможно, это разные люди:`);
+    log(`  ❗ПРОВЕРЬТЕ КОНТРАГЕНТА (сводно): ${CP_PHONE_WARNINGS.length} заказ(ов) пропущено из-за несовпадения телефонов у одноимённых контрагентов:`);
     for (const w of CP_PHONE_WARNINGS) log(`    - [${w.name}]: в отчёте ${w.reportPhone}, в карточке «${w.cpName}» — ${w.cpPhone}`);
   }
   if (stats.mismatchOrders > 0) {
@@ -2844,10 +2872,22 @@ async function processReport(reportTextRaw) {
   } else {
     log(`  [OK] Несостыковок по суммам за этот запуск не обнаружено.`);
   }
+  if (stats.createdPayments > 0) {
+    log(`  [OK] Входящих платежей ${DRY_RUN ? 'в тестовом прогоне' : 'создано'}: ${stats.createdPayments}.`);
+  }
   if (stats.missingPayments > 0) {
     log(`  ПЛАТЁЖ НЕ СОЗДАН (сводно): ${stats.missingPayments} заказ(ов) без входящего платежа — создайте вручную в МоемСкладе.`);
-  } else {
-    log(`  [OK] Все входящие платежи созданы автоматически.`);
+  }
+  if (stats.ozonAmountDifferences.length) {
+    const reportSum = stats.ozonAmountDifferences.reduce((sum, order) => sum + order.reportSum, 0);
+    const paymentSum = stats.ozonAmountDifferences.reduce((sum, order) => sum + order.paymentSum, 0);
+    log(`  СВЕРКА ОЗОН (сводно): ${stats.ozonAmountDifferences.length} заказ(ов) с разницей. В отчёте ${(reportSum / 100).toFixed(2)} ₽, расчёт платежей по отгрузкам ${(paymentSum / 100).toFixed(2)} ₽, разница ${((reportSum - paymentSum) / 100).toFixed(2)} ₽.`);
+  }
+  if (deliveryNotes.length) {
+    log(`  Записей о доставке без товаров: ${deliveryNotes.length}.`);
+    for (const { header, description, total } of deliveryNotes) {
+      log(`    - [${header}]: ${description}${total ? ` (${total})` : ''}`);
+    }
   }
   if (stats.cancelledOzon && stats.cancelledOzon.length) {
     log(`  ❌ ОТМЕНЁННЫЕ ОЗОН (сводно): ${stats.cancelledOzon.length} заказ(ов) — товар НЕ списан. Проверьте, не уехал ли он со склада (отмена в день передачи в доставку), иначе при возврате будет «лишний» приход и недостача:`);
