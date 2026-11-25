@@ -710,7 +710,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '18.11.2026-3 (общий итог нескольких подзаказов)';
+const APP_VERSION = '25.11.2026-1 (итоги заказов и проверка комплектации)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -1101,6 +1101,8 @@ function findProductMeta(pRaw, weight) {
       const queryHasTruffle = /трюфел/i.test(query);
       const nameHasTruffle = /трюфел/i.test(nameLower);
       if (queryHasTruffle !== nameHasTruffle) continue;
+
+      if (/бокс.*с\s+логотипом/i.test(query) && !/с\s+логотипом/i.test(nameLower)) continue;
 
       // Каталог часто содержит подарочные наборы/комплекты, чьё длинное название
       // случайно включает в себя ВСЕ слова короткого запроса — например простой весовой
@@ -1598,6 +1600,12 @@ function extractReportTotalKopecks(blockText) {
   const blockLines = blockText.split('\n');
   const combinedPaymentLabel = /^итого\s+за\s+об[ае]\s+оплатил[аи]?(?=\s|:|$)\s*:?\s*/i;
   if (itogoRub === null) {
+    for (const line of blockLines) {
+      const total = line.trim().match(/^всего\s*:\s*\d+(?:[.,]\d+)?(?:\s*\+\s*\d+(?:[.,]\d+)?)+\s*=\s*(\d+(?:[.,]\d+)?)\s*(?:₽|р(?:уб[а-яё]*)?\.?)?$/i);
+      if (total) itogoRub = Number(total[1].replace(',', '.'));
+    }
+  }
+  if (itogoRub === null) {
     // «Итого за оба оплатил: 21100 Климу на втб» — общий итог блока из отчёта 18.11.
     for (const rawLine of blockLines) {
       const line = rawLine.trim();
@@ -1646,6 +1654,12 @@ function extractReportTotalKopecks(blockText) {
       }
     }
     if (count > 0) itogoRub = sumRub;
+    else if (!seenItemLine) {
+      for (const rawLine of blockLines) {
+        const total = rawLine.trim().match(/^итого\s*:?\s*(\d.*)$/i);
+        if (total) itogoRub = extractOneTotalRub(total[1]) ?? itogoRub;
+      }
+    }
   }
 
   if (itogoRub === null) {
@@ -2319,6 +2333,7 @@ async function processReport(reportTextRaw) {
     }
 
     let itemsSell = [];
+    const missingSaleItems = [];
     let itemsLoss = [];
     let lastItem = null;
 
@@ -2573,6 +2588,7 @@ async function processReport(reportTextRaw) {
         const bundleTotalPrice = extractTextPrice(content);
         if (bundleTotalPrice === null) {
           log(`  [!!!] ВНИМАНИЕ: Набор '${pRaw}' — не нашёл цену набора в строке, разделить между компонентами не могу!`);
+          if (!isGift) missingSaleItems.push(pRaw);
           continue;
         }
         const n = bundleComponents.length;
@@ -2596,7 +2612,10 @@ async function processReport(reportTextRaw) {
             : { quantity: weight, assortment: { meta: compData.meta }, price: shareKop, _name: compData.name, _catalog_price: compData.price, _alreadyDiscounted: alreadyDiscounted };
           bundleItems.push({ item: target, shareKop, isGift, compExact });
         });
-        if (!bundleOk) continue;
+        if (!bundleOk) {
+          if (!isGift) missingSaleItems.push(pRaw);
+          continue;
+        }
         for (const { item, shareKop, isGift: itGift, compExact } of bundleItems) {
           if (itGift) {
             log(`  [🎁 ПОДАРОК НАБОРА] '${pRaw}' -> '${item._name}' (Кол-во: ${weight}) -> В СПИСАНИЕ`);
@@ -2617,6 +2636,7 @@ async function processReport(reportTextRaw) {
         log(`  [!!!] ВНИМАНИЕ: Товар '${pRaw}' не найден!`);
         if (!stats.notFound) stats.notFound = [];
         stats.notFound.push({ header, what: `'${pRaw}'` });
+        if (!isGift) missingSaleItems.push(pRaw);
         continue;
       }
       const nameExactMatch = productData.viaManualMap || namesMatchExactly(pRaw, productData.name);
@@ -2649,7 +2669,7 @@ async function processReport(reportTextRaw) {
     }
 
     // --- УМНОЕ СПАСЕНИЕ ---
-    if (!itemsSell.length && !itemsLoss.length) {
+    if (!itemsSell.length && !itemsLoss.length && !missingSaleItems.length) {
       for (const line of lines.slice(1)) {
         const lineLower = line.toLowerCase();
         if (percentOnlyLineRegex.test(line.trim())) continue;
@@ -2735,7 +2755,11 @@ async function processReport(reportTextRaw) {
     }
 
     // --- ОТГРУЗКА ---
-    if (!itemsSell.length) {
+    if (missingSaleItems.length) {
+      const reason = `не удалось собрать все позиции: ${missingSaleItems.join(', ')}`;
+      log(`  [ПРОПУСК] Заказ [${header}] (${name}): ${reason}. Отгрузка и платёж не созданы.`);
+      stats.skippedEmptyOrders.push({ header, reason });
+    } else if (!itemsSell.length) {
       log(`  [ПРОПУСК] В заказе [${header}] (${name}) не найдено товаров. Отгрузка не создана.`);
       // "Недозаказ" — часто это не брошенный заказ, а ДОПЛАТА/коррекция по старому заказу
       // (например "0.1 ДОПЛАТА / Заказ №4 от 17.10 / 1) Парм 60 мес - 0.016 / Итого: 100" —
