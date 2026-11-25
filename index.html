@@ -35,11 +35,7 @@
   button.secondary { background: #e5e5ea; color: #1c1c1e; font-weight: 500; }
   button:active { opacity: 0.8; }
   button:disabled { opacity: 0.5; }
-  .report-actions { display: grid; grid-template-columns: 1.2fr 1fr; gap: 8px; margin-top: 4px; }
-  .report-actions button { padding: 16px; font-size: 17px; margin: 0; }
-  @media (max-width: 390px) {
-    .report-actions { grid-template-columns: 1fr; }
-  }
+  #processBtn { width: 100%; padding: 16px; font-size: 17px; margin-top: 4px; }
   .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
   #status { font-size: 13px; margin: 6px 0 0; color: #666; min-height: 16px; }
   #log {
@@ -61,6 +57,8 @@
   #log .l-link a:active { opacity: 0.7; }
   .toolbar { display: flex; gap: 8px; margin-top: 10px; }
   .toolbar button { margin-top: 0; flex: 1; padding: 10px; font-size: 13px; }
+  .settings-actions { flex-wrap: wrap; }
+  .settings-actions button { flex-basis: 110px; }
   #priceDialog { width: min(960px, calc(100% - 24px)); max-height: 90vh; padding: 18px; border: 0; border-radius: 12px; color: inherit; }
   #priceDialog::backdrop { background: #0008; }
   #priceRowsWrap { overflow: auto; max-height: 48vh; margin: 12px 0; }
@@ -201,9 +199,10 @@
     <label for="nocoPriceToken">Токен NocoDB для чтения каталога</label>
     <input type="password" id="nocoPriceToken" autocomplete="off" autocapitalize="off" spellcheck="false">
 
-    <div class="toolbar">
+    <div class="toolbar settings-actions">
       <button id="saveSettingsBtn">Сохранить</button>
       <button id="testConnBtn" class="secondary">Проверить связь</button>
+      <button id="updatePricesBtn" class="secondary">Обновить цены</button>
     </div>
     <p id="settingsStatus" class="hint"></p>
   </details>
@@ -215,10 +214,7 @@
       <input type="checkbox" id="dryRunCheckbox" style="width:auto; margin:0;">
       🧪 Тестовый прогон — показать журнал, но ничего не создавать в МоемСкладе
     </label>
-    <div class="report-actions">
-      <button id="processBtn">Провести ▶</button>
-      <button id="updatePricesBtn" class="secondary">Обновить цены</button>
-    </div>
+    <button id="processBtn">Провести ▶</button>
     <p id="status"></p>
   </div>
 
@@ -229,7 +225,7 @@
     <p id="priceStatus" class="hint" role="status"></p>
     <div id="priceRowsWrap" hidden>
       <table>
-        <thead><tr><th scope="col">Применить</th><th scope="col">NocoDB</th><th scope="col">МойСклад</th><th scope="col">Цена в МойСклад</th><th scope="col">Статус</th></tr></thead>
+        <thead><tr><th scope="col">Применить</th><th scope="col">NocoDB</th><th scope="col">МойСклад</th><th scope="col">Единицы NocoDB → МойСклад</th><th scope="col">Цена в МойСклад</th><th scope="col">Статус</th></tr></thead>
         <tbody id="priceRows"></tbody>
       </table>
     </div>
@@ -3146,7 +3142,7 @@ async function loadAvailablePrices(token) {
 
 async function loadProductsForPriceUpdate() {
   const products = [];
-  const limit = 1000;
+  const limit = 100;
   for (let offset = 0; ; offset += limit) {
     const response = await msFetch(apiUrl(`/entity/product?expand=uom&limit=${limit}&offset=${offset}`), { headers: msHeaders() });
     if (!response.ok) throw new Error(`Не удалось прочитать карточки МойСклад (${response.status}).`);
@@ -3156,25 +3152,53 @@ async function loadProductsForPriceUpdate() {
     if (data.rows.length < limit && !data.meta?.nextHref) break;
     if (data.rows.length !== limit) throw new Error('МойСклад вернул неполную страницу товаров.');
   }
+  const uoms = new Map();
+  for (const product of products) product.uom = await resolvePriceUom(product.uom, uoms);
   return products;
+}
+
+async function resolvePriceUom(uom, cache) {
+  const path = uom?.meta?.href?.match(/\/entity\/uom\/[a-f0-9-]+$/i)?.[0];
+  if (uom?.name) {
+    if (path) cache.set(path, uom);
+    return uom;
+  }
+  if (!path) return uom;
+  if (cache.has(path)) return cache.get(path);
+  try {
+    const response = await msFetch(apiUrl(path), { headers: msHeaders() });
+    if (response.ok) {
+      const unit = await response.json();
+      if (unit?.name) {
+        cache.set(path, unit);
+        return unit;
+      }
+    }
+  } catch {
+    // Недоступная единица будет отмечена в предпросмотре, строка останется без записи.
+  }
+  cache.set(path, uom);
+  return uom;
 }
 
 function parseNocoPrice(fields) {
   const text = String(fields.Price ?? '').toLowerCase().replace(/\s+/g, '');
-  const match = text.match(/^(\d+(?:[.,]\d{1,2})?)(?:[₽рp]|руб\.?)?(?:(?:\/|за)(100г(?:р)?|кг|шт\.?|г(?:р)?))?$/i);
+  const match = text.match(/^(\d+(?:[.,]\d{1,2})?)(?:₽|[рp]\.?|руб\.?)?(?:(?:\/|за)(100гр?|1?кг|1?шт|1?гр?|упак|компл|набор)\.?)?$/i);
   if (!match) return null;
   const value = Math.round(Number(match[1].replace(',', '.')) * 100);
   if (!Number.isSafeInteger(value) || value <= 0) return null;
-  const unit = match[2]?.replace(/\.$/, '').replace(/гр$/, 'г');
-  if (!unit && fields['Весовой'] === true) return null;
-  return { value, unit: unit || 'шт' };
+  const unit = match[2]?.replace(/^1(?!00)/, '').replace(/гр$/, 'г');
+  return { value, unit: unit || (fields['Весовой'] === true ? '' : 'шт') };
 }
 
 function productPriceUnit(product) {
   const unit = product.uom?.name?.trim().toLowerCase().replace(/\.$/, '');
-  if (['кг', 'килограмм', 'килограммы'].includes(unit)) return 'кг';
-  if (['г', 'гр', 'грамм', 'граммы'].includes(unit)) return 'г';
-  if (['шт', 'штука', 'штуки', 'упак', 'упаковка', 'комплект', 'набор'].includes(unit)) return 'шт';
+  if (['кг', 'килограмм', 'килограммы', 'килограмм (кг)', 'кг (килограмм)'].includes(unit)) return 'кг';
+  if (['г', 'гр', 'грамм', 'граммы', 'грамм (г)', 'г (грамм)'].includes(unit)) return 'г';
+  if (['шт', 'штука', 'штуки', 'штука (шт)', 'шт (штука)'].includes(unit)) return 'шт';
+  if (['упак', 'упаковка'].includes(unit)) return 'упак';
+  if (['компл', 'комплект'].includes(unit)) return 'компл';
+  if (unit === 'набор') return unit;
   return '';
 }
 
@@ -3187,7 +3211,8 @@ function convertNocoPrice(price, unit) {
 function buildPricePreview(records, products) {
   const rows = records.map(({ id, fields }) => {
     const name = String(fields.Name ?? '').trim();
-    const row = { id, fields, name, reason: '' };
+    const price = parseNocoPrice(fields);
+    const row = { id, fields, name, sourceUnit: price?.unit, reason: '' };
     if (!name) return { ...row, reason: 'В NocoDB нет названия' };
     const exact = products.filter(product => namesMatchExactly(name, (product.name || '').trim()));
     if (exact.length > 1) return { ...row, reason: 'Несколько карточек с таким названием' };
@@ -3200,18 +3225,20 @@ function buildPricePreview(records, products) {
     if (!path) return { ...row, reason: 'Карточка не найдена' };
     row.product = product;
     row.path = path;
+    row.unit = productPriceUnit(product);
     const prices = product.salePrices || [];
     const current = prices[salePriceIndex(prices)];
     if (!current?.priceType?.meta?.href || !Number.isSafeInteger(current.value)) {
       return { ...row, reason: 'В карточке не определена цена продажи' };
     }
-    row.unit = productPriceUnit(product);
     row.oldPrice = current.value;
     row.priceTypeHref = current.priceType.meta.href;
-    const price = parseNocoPrice(fields);
-    if (!price) return { ...row, reason: 'Проверьте формат цены или единицу в NocoDB' };
+    if (!price) return { ...row, reason: 'Не удалось разобрать цену в NocoDB' };
+    if (!price.unit) return { ...row, reason: 'Укажите в NocoDB, за какой вес задана цена' };
+    if (!row.unit) return { ...row, reason: product.uom?.name ? 'Единица МойСклад не поддерживается' : 'Не удалось прочитать единицу МойСклад' };
     const value = convertNocoPrice(price, row.unit);
-    if (!Number.isSafeInteger(value) || value <= 0) return { ...row, reason: 'Нужна сверка единиц измерения' };
+    if (value === null) return { ...row, reason: 'Единицы различаются, пересчёт невозможен' };
+    if (!Number.isSafeInteger(value) || value <= 0) return { ...row, reason: 'Цена после пересчёта вне допустимого диапазона' };
     row.newPrice = value;
     row.review = Boolean(match && !match.viaManualMap);
     return row;
@@ -3233,6 +3260,7 @@ async function writePreviewedPrice(row) {
   const response = await msFetch(`${url}?expand=uom`, { headers: msHeaders() });
   if (!response.ok) throw new Error(`ошибка чтения ${response.status}`);
   const product = await response.json();
+  product.uom = await resolvePriceUom(product.uom, new Map());
   const prices = product.salePrices || [];
   const index = salePriceIndex(prices);
   if (product.archived || product.name !== row.product.name || productPriceUnit(product) !== row.unit ||
@@ -3253,6 +3281,8 @@ const settingsStatusEl = document.getElementById('settingsStatus');
 const updatePricesBtn = document.getElementById('updatePricesBtn');
 const priceDialog = document.getElementById('priceDialog');
 const nocoPriceToken = document.getElementById('nocoPriceToken');
+const NOCO_PRICE_TOKEN_KEY = 'noco_price_token';
+nocoPriceToken.value = localStorage.getItem(NOCO_PRICE_TOKEN_KEY) || '';
 const previewPricesBtn = document.getElementById('previewPricesBtn');
 const applyPricesBtn = document.getElementById('applyPricesBtn');
 const closePricesBtn = document.getElementById('closePricesBtn');
@@ -3276,10 +3306,12 @@ function renderPricePreview() {
   const fragment = document.createDocumentFragment();
   for (const row of pricePreview) {
     const tr = document.createElement('tr');
-    const price = Number.isSafeInteger(row.newPrice)
-      ? `${priceFormat.format(row.oldPrice / 100)} → ${priceFormat.format(row.newPrice / 100)} / ${row.unit}`
-      : '—';
-    const values = ['', `${row.name || 'Без названия'} · ${row.fields.Price ?? '—'}`, row.product?.name || '—', price,
+    const oldPrice = Number.isSafeInteger(row.oldPrice) ? priceFormat.format(row.oldPrice / 100) : '—';
+    const price = Number.isSafeInteger(row.newPrice) ? `${oldPrice} → ${priceFormat.format(row.newPrice / 100)}` : oldPrice;
+    const sourceUnit = row.sourceUnit === '100г' ? '100 г' : (row.sourceUnit || '—');
+    const targetUnit = row.product?.uom?.name || '—';
+    const values = ['', `${row.name || 'Без названия'} · ${row.fields.Price ?? '—'}`, row.product?.name || '—',
+      `${sourceUnit} → ${targetUnit}`, price,
       row.reason || (row.review ? 'Проверьте совпадение названий' : 'Готово к обновлению')];
     for (const value of values) {
       const cell = document.createElement('td');
@@ -3328,7 +3360,6 @@ priceDialog.addEventListener('cancel', event => {
   if (priceBusy) event.preventDefault();
 });
 priceDialog.addEventListener('close', () => {
-  nocoPriceToken.value = '';
   pricePreview = [];
   priceStatus.textContent = '';
   renderPricePreview();
@@ -3397,6 +3428,9 @@ applyPricesBtn.addEventListener('click', async () => {
 
 document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   saveConfig();
+  const token = nocoPriceToken.value.trim();
+  localStorage.setItem(NOCO_PRICE_TOKEN_KEY, token);
+  nocoPriceToken.value = token;
   settingsStatusEl.textContent = '✓ Сохранено на этом устройстве.';
   setTimeout(() => { settingsStatusEl.textContent = ''; }, 3000);
 });
