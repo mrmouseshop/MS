@@ -35,7 +35,11 @@
   button.secondary { background: #e5e5ea; color: #1c1c1e; font-weight: 500; }
   button:active { opacity: 0.8; }
   button:disabled { opacity: 0.5; }
-  #processBtn { width: 100%; padding: 16px; font-size: 17px; margin-top: 4px; }
+  .report-actions { display: grid; grid-template-columns: 1.2fr 1fr; gap: 8px; margin-top: 4px; }
+  .report-actions button { padding: 16px; font-size: 17px; margin: 0; }
+  @media (max-width: 390px) {
+    .report-actions { grid-template-columns: 1fr; }
+  }
   .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
   #status { font-size: 13px; margin: 6px 0 0; color: #666; min-height: 16px; }
   #log {
@@ -194,6 +198,9 @@
     <label for="storeId">ID склада (store)</label>
     <input type="text" id="storeId" placeholder="например c0170072-ecc2-...">
 
+    <label for="nocoPriceToken">Токен NocoDB для чтения каталога</label>
+    <input type="password" id="nocoPriceToken" autocomplete="off" autocapitalize="off" spellcheck="false">
+
     <div class="toolbar">
       <button id="saveSettingsBtn">Сохранить</button>
       <button id="testConnBtn" class="secondary">Проверить связь</button>
@@ -208,19 +215,16 @@
       <input type="checkbox" id="dryRunCheckbox" style="width:auto; margin:0;">
       🧪 Тестовый прогон — показать журнал, но ничего не создавать в МоемСкладе
     </label>
-    <button id="processBtn">Провести ▶</button>
+    <div class="report-actions">
+      <button id="processBtn">Провести ▶</button>
+      <button id="updatePricesBtn" class="secondary">Обновить цены</button>
+    </div>
     <p id="status"></p>
   </div>
 
-  <div class="card">
-    <h2>Цены из NocoDB</h2>
-    <button id="updatePricesBtn" class="secondary">Обновить цены</button>
-  </div>
   <dialog id="priceDialog" aria-labelledby="priceDialogTitle">
     <h2 id="priceDialogTitle">Обновить цены из NocoDB</h2>
     <p class="hint">В предпросмотр попадают позиции с галочкой Availability. Запись начнётся после применения выбранных изменений.</p>
-    <label for="nocoPriceToken">Токен NocoDB для чтения каталога</label>
-    <input type="password" id="nocoPriceToken" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="previewPricesBtn" class="secondary">Показать изменения</button>
     <p id="priceStatus" class="hint" role="status"></p>
     <div id="priceRowsWrap" hidden>
@@ -3262,7 +3266,6 @@ let priceBusy = false;
 function refreshPriceControls() {
   previewPricesBtn.disabled = priceBusy;
   closePricesBtn.disabled = priceBusy;
-  nocoPriceToken.disabled = priceBusy;
   applyPricesBtn.disabled = priceBusy || !pricePreview.some(row => row.selected);
   for (const row of pricePreview) {
     if (row.checkbox) row.checkbox.disabled = priceBusy;
@@ -3304,11 +3307,19 @@ function renderPricePreview() {
 
 updatePricesBtn.addEventListener('click', () => {
   loadConfig();
+  const settingsBlock = document.getElementById('settingsBlock');
   if (!CONFIG.workerUrl || !CONFIG.token) {
     settingsStatusEl.textContent = 'Укажите адрес прокси и токен МойСклад.';
-    document.getElementById('settingsBlock').open = true;
+    settingsBlock.open = true;
     return;
   }
+  if (!nocoPriceToken.value.trim()) {
+    settingsStatusEl.textContent = 'Введите токен NocoDB для чтения таблицы Price.';
+    settingsBlock.open = true;
+    nocoPriceToken.focus();
+    return;
+  }
+  settingsStatusEl.textContent = '';
   priceDialog.showModal();
 });
 
@@ -3322,17 +3333,10 @@ priceDialog.addEventListener('close', () => {
   priceStatus.textContent = '';
   renderPricePreview();
 });
-nocoPriceToken.addEventListener('input', () => {
-  pricePreview = [];
-  priceStatus.textContent = '';
-  renderPricePreview();
-});
-
 previewPricesBtn.addEventListener('click', async () => {
   const token = nocoPriceToken.value.trim();
   if (!token) {
-    priceStatus.textContent = 'Введите токен NocoDB для чтения таблицы Price.';
-    nocoPriceToken.focus();
+    priceStatus.textContent = 'Закройте окно и введите токен NocoDB в настройках подключения.';
     return;
   }
   priceBusy = true;
