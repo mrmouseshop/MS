@@ -57,6 +57,12 @@
   #log .l-link a:active { opacity: 0.7; }
   .toolbar { display: flex; gap: 8px; margin-top: 10px; }
   .toolbar button { margin-top: 0; flex: 1; padding: 10px; font-size: 13px; }
+  #priceDialog { width: min(960px, calc(100% - 24px)); max-height: 90vh; padding: 18px; border: 0; border-radius: 12px; color: inherit; }
+  #priceDialog::backdrop { background: #0008; }
+  #priceRowsWrap { overflow: auto; max-height: 48vh; margin: 12px 0; }
+  #priceDialog table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #priceDialog th, #priceDialog td { padding: 7px; border-bottom: 1px solid #ddd; text-align: left; vertical-align: top; }
+  #priceDialog th { position: sticky; top: 0; background: #f5f5f7; }
   .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: #eee; color: #555; margin-left: 6px; }
   .pending-item {
     border: 1px solid #fed7aa; background: #fff7ed; border-radius: 10px;
@@ -205,6 +211,29 @@
     <button id="processBtn">Провести ▶</button>
     <p id="status"></p>
   </div>
+
+  <div class="card">
+    <h2>Цены из NocoDB</h2>
+    <button id="updatePricesBtn" class="secondary">Обновить цены</button>
+  </div>
+  <dialog id="priceDialog" aria-labelledby="priceDialogTitle">
+    <h2 id="priceDialogTitle">Обновить цены из NocoDB</h2>
+    <p class="hint">В предпросмотр попадают позиции с галочкой Availability. Запись начнётся после применения выбранных изменений.</p>
+    <label for="nocoPriceToken">Токен NocoDB для чтения каталога</label>
+    <input type="password" id="nocoPriceToken" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="previewPricesBtn" class="secondary">Показать изменения</button>
+    <p id="priceStatus" class="hint" role="status"></p>
+    <div id="priceRowsWrap" hidden>
+      <table>
+        <thead><tr><th scope="col">Применить</th><th scope="col">NocoDB</th><th scope="col">МойСклад</th><th scope="col">Цена в МойСклад</th><th scope="col">Статус</th></tr></thead>
+        <tbody id="priceRows"></tbody>
+      </table>
+    </div>
+    <div class="toolbar">
+      <button id="closePricesBtn" class="secondary">Закрыть</button>
+      <button id="applyPricesBtn" disabled>Применить выбранные цены</button>
+    </div>
+  </dialog>
 
   <div class="card">
     <h2>⏳ Ждут сборки/отгрузки (ОЗОН) <span class="badge" id="pendingOzonCount">пусто</span></h2>
@@ -710,12 +739,17 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '25.11.2026-1 (итоги заказов и проверка комплектации)';
+const APP_VERSION = '25.11.2026-4 (сверка цен с NocoDB)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
 
 const DISCOUNT_EXCLUDE_KEYWORDS = []; // ручной список сверх основного правила (по умолчанию пуст)
+
+function salePriceIndex(prices) {
+  return prices.findIndex(({ priceType }) => priceType?.name === 'Цена продажи' ||
+    priceType?.externalCode === 'cbcf493b-55bc-11d9-848a-00112f43529a');
+}
 
 async function loadProducts() {
   log(`Версия программы: ${APP_VERSION}`);
@@ -726,14 +760,18 @@ async function loadProducts() {
     throw new Error('load_products failed');
   }
   const data = await resp.json();
+  indexProducts(data.rows || []);
+}
+
+function indexProducts(products) {
   PRODUCTS_CACHE = {};
   ARTICLE_CACHE = {};
-  for (const item of (data.rows || [])) {
+  for (const item of products) {
     const fullName = (item.name || '').trim();
     const salePrices = item.salePrices || [];
     const price = salePrices.length ? salePrices[0].value : 0;
     const buyPrice = (item.buyPrice && item.buyPrice.value) || 0;
-    PRODUCTS_CACHE[fullName] = { meta: item.meta, price: price, buy_price: buyPrice };
+    PRODUCTS_CACHE[fullName] = { meta: item.meta, price, buy_price: buyPrice, sale_price: salePrices[salePriceIndex(salePrices)]?.value };
     const article = (item.article || '').trim();
     if (article) {
       // Иногда в одно поле "Артикул" в МоемСкладе вписывают СРАЗУ НЕСКОЛЬКО кодов через
@@ -1479,7 +1517,7 @@ async function demandAlreadyExists(cId, dateStr, descText) {
   const descNorm = normalizeDescForCompare(descText);
   for (const row of (data.rows || [])) {
     const agentHref = (row.agent && row.agent.meta && row.agent.meta.href) || '';
-    if (agentHref.endsWith('/counterparty/' + cId) && normalizeDescForCompare(row.description) === descNorm) return true;
+    if ((!cId || agentHref.endsWith('/counterparty/' + cId)) && normalizeDescForCompare(row.description) === descNorm) return row;
   }
   return false;
 }
@@ -1761,6 +1799,66 @@ function stripInternalFields(items) {
     const out = {};
     for (const k in it) if (!k.startsWith('_')) out[k] = it[k];
     return out;
+  });
+}
+
+async function fillZeroSalePrices(items, checkedProducts) {
+  const candidates = new Map();
+  const conflicting = new Set();
+  for (const item of items) {
+    if (!Number.isSafeInteger(item._catalogPriceCandidate) || item._catalogPriceCandidate <= 0) continue;
+    const href = item.assortment.meta.href;
+    if (checkedProducts.has(href)) continue;
+    const previous = candidates.get(href);
+    if (previous && previous._catalogPriceCandidate !== item._catalogPriceCandidate) conflicting.add(href);
+    candidates.set(href, item);
+  }
+
+  for (const [href, item] of candidates) {
+    const path = href?.match(/\/entity\/product\/[a-f0-9-]+$/i)?.[0];
+    if (!path) continue;
+    if (conflicting.has(href)) {
+      log(`  [ПРЕДУПРЕЖДЕНИЕ] Цена в карточке «${item._name}» не заполнена: в заказе указаны разные цены за единицу.`);
+      continue;
+    }
+    try {
+      const url = apiUrl(path);
+      const response = await msFetch(url, { headers: msHeaders() });
+      if (!response.ok) throw new Error(`чтение карточки, код ${response.status}`);
+      const { salePrices } = await response.json();
+      const index = Array.isArray(salePrices) ? salePriceIndex(salePrices) : -1;
+      const current = salePrices?.[index];
+      if (!current?.priceType?.meta?.href) throw new Error('в карточке не определён тип цены продажи');
+      if (current.value !== 0) {
+        checkedProducts.add(href);
+        continue;
+      }
+      const value = item._catalogPriceCandidate;
+      if (!DRY_RUN) {
+        salePrices[index] = { ...current, value };
+        const updated = await msFetch(url, { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ salePrices }) });
+        if (!updated.ok) throw new Error(`запись цены, код ${updated.status}`);
+      }
+      checkedProducts.add(href);
+      log(`  [ЦЕНА В КАРТОЧКЕ] «${item._name}»: 0 ₽ → ${(value / 100).toFixed(2)} ₽${drSuffix()}.`);
+    } catch (err) {
+      log(`  [ПРЕДУПРЕЖДЕНИЕ] Не удалось заполнить цену в карточке «${item._name}»: ${err.message}.`);
+    }
+  }
+}
+
+async function excludeDiscountedItemsAlreadyShipped(items, demand, header) {
+  const resp = await msFetch(apiUrl('/entity/demand/' + encodeURIComponent(demand.id) + '/positions?limit=1000'), { headers: msHeaders() });
+  const data = resp.ok ? await resp.json() : null;
+  if (!Array.isArray(data?.rows) || data.meta?.nextHref || data.meta?.size > data.rows.length) {
+    log(`  [ПРЕДУПРЕЖДЕНИЕ] Заказ [${header}]: не удалось проверить все позиции существующей отгрузки. Проверьте списание товаров со скидкой до нуля вручную.`);
+    return items.filter(item => !item._fullyDiscounted);
+  }
+  const shippedFree = new Set(data.rows.filter(row => row.price === 0).map(row => row.assortment?.meta?.href));
+  return items.filter(item => {
+    if (!item._fullyDiscounted || !shippedFree.has(item.assortment.meta.href)) return true;
+    log(`  [ПРОПУСК] Заказ [${header}]: «${item._name}» уже учтён в отгрузке с нулевой ценой.`);
+    return false;
   });
 }
 
@@ -2245,6 +2343,7 @@ async function processReport(reportTextRaw) {
   // несостыковок/непроведённых платежей вручную.
   const stats = { mismatchKop: 0, mismatchOrders: 0, createdPayments: 0, missingPayments: 0, lossDocs: 0, priceCheckCount: 0, priceCheckDiffKop: 0, skippedEmptyOrders: [], nameMismatches: [], ozonAmountDifferences: [] };
   const deliveryNotes = [];
+  const checkedCatalogPrices = new Set();
   CP_PHONE_CONFLICTS = [];
 
   for (const [header, block] of orders) {
@@ -2361,7 +2460,16 @@ async function processReport(reportTextRaw) {
         if (underItemLine && lastLineSellItems.length) {
           const curKop = lastLineSellItems.reduce((s, it) => s + it.quantity * it.price, 0);
           const finalKop = perItemFinalRub * 100;
-          if (curKop > 0) {
+          if (finalKop === 0) {
+            itemsSell = itemsSell.filter(item => !lastLineSellItems.includes(item));
+            for (const item of lastLineSellItems) {
+              item.price = item._buy_price;
+              item._fullyDiscounted = true;
+              itemsLoss.push(item);
+              log(`  [🎁 СКИДКА ДО НУЛЯ] «${item._name}» (Кол-во: ${item.quantity}) → в списание.`);
+            }
+            lastLineSellItems = [];
+          } else if (curKop > 0) {
             const k = finalKop / curKop;
             for (const it of lastLineSellItems) {
               it.price = pyRound(it.price * k);
@@ -2397,6 +2505,10 @@ async function processReport(reportTextRaw) {
       );
 
       if (!isItem) continue;
+      if (!underItemLine) {
+        underItemLine = true;
+        lastLineSellItems = [];
+      }
 
       let content = line.replace(/^\d+[)\.]\s*/, '').trim();
 
@@ -2510,7 +2622,7 @@ async function processReport(reportTextRaw) {
         lastItem.quantity = weight;
         let priceNote = '';
         const contPrice = extractTextPrice(content);
-        if (contPrice !== null) {
+        if (contPrice !== null && !lastItem._fullyDiscounted) {
           const catalogPrice = lastItem._catalog_price !== undefined ? lastItem._catalog_price : contPrice;
           reportPriceMismatch(lastItem._name || '?', contPrice, catalogPrice, stats);
           lastItem.price = contPrice;
@@ -2609,7 +2721,7 @@ async function processReport(reportTextRaw) {
           const compExact = compData.viaManualMap || namesMatchExactly(compName, compData.name);
           const target = isGift
             ? { quantity: weight, assortment: { meta: compData.meta }, price: compData.buy_price, _name: compData.name }
-            : { quantity: weight, assortment: { meta: compData.meta }, price: shareKop, _name: compData.name, _catalog_price: compData.price, _alreadyDiscounted: alreadyDiscounted };
+            : { quantity: weight, assortment: { meta: compData.meta }, price: shareKop, _name: compData.name, _catalog_price: compData.price, _buy_price: compData.buy_price, _alreadyDiscounted: alreadyDiscounted };
           bundleItems.push({ item: target, shareKop, isGift, compExact });
         });
         if (!bundleOk) {
@@ -2649,6 +2761,7 @@ async function processReport(reportTextRaw) {
         lastItem = newItem;
       } else {
         let sellPrice = productData.price;
+        let catalogPriceCandidate = null;
         if (itemDiscountMatch) {
           const finalTotalRub = parseFloat(itemDiscountMatch[1].replace(',', '.'));
           sellPrice = pyRound((finalTotalRub / (weight || 1)) * 100);
@@ -2658,10 +2771,13 @@ async function processReport(reportTextRaw) {
           if (textPrice !== null) {
             reportPriceMismatch(productData.name, textPrice, productData.price, stats);
             sellPrice = textPrice;
+            if (nameExactMatch && !alreadyDiscounted && PRODUCTS_CACHE[productData.name]?.sale_price === 0) {
+              catalogPriceCandidate = textPrice;
+            }
           }
         }
         log(`  [${nameExactMatch ? 'OK' : 'ПРОВЕРЬТЕ НАЗВАНИЕ'}] Товар '${pRaw}' найден как '${productData.name}' (Кол-во: ${weight}, Цена: ${(sellPrice / 100).toFixed(2)} ₽)${alreadyDiscounted ? ' [уже со скидкой — не участвует в автоскидке заказа]' : ''}`);
-        const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: sellPrice, _name: productData.name, _catalog_price: productData.price, _alreadyDiscounted: alreadyDiscounted };
+        const newItem = { quantity: weight, assortment: { meta: productData.meta }, price: sellPrice, _name: productData.name, _catalog_price: productData.price, _buy_price: productData.buy_price, _alreadyDiscounted: alreadyDiscounted, _catalogPriceCandidate: catalogPriceCandidate };
         itemsSell.push(newItem);
         lastLineSellItems.push(newItem);
         lastItem = newItem;
@@ -2755,10 +2871,13 @@ async function processReport(reportTextRaw) {
     }
 
     // --- ОТГРУЗКА ---
+    let existingDemand;
     if (missingSaleItems.length) {
       const reason = `не удалось собрать все позиции: ${missingSaleItems.join(', ')}`;
       log(`  [ПРОПУСК] Заказ [${header}] (${name}): ${reason}. Отгрузка и платёж не созданы.`);
       stats.skippedEmptyOrders.push({ header, reason });
+    } else if (!itemsSell.length && itemsLoss.some(item => item._fullyDiscounted)) {
+      log(`  [СКИДКА ДО НУЛЯ] В заказе [${header}] (${name}) остались только позиции к списанию.`);
     } else if (!itemsSell.length) {
       log(`  [ПРОПУСК] В заказе [${header}] (${name}) не найдено товаров. Отгрузка не создана.`);
       // "Недозаказ" — часто это не брошенный заказ, а ДОПЛАТА/коррекция по старому заказу
@@ -2775,8 +2894,10 @@ async function processReport(reportTextRaw) {
       const fullDesc = `${header}\n${block.trim()}`;
       const cId = await getOrCreateCounterparty(name, findPhone(block));
       if (cId) {
-        if (await demandAlreadyExists(cId, reportDate, fullDesc)) {
+        existingDemand = await demandAlreadyExists(cId, reportDate, fullDesc);
+        if (existingDemand) {
           log(`  [ПРОПУСК] Отгрузка [${header}] (${name}) уже есть в МоемСкладе (похоже, отчёт уже обрабатывался) — дубль не создаю.`);
+          if (existingDemand.applicable !== false) await fillZeroSalePrices(itemsSell, checkedCatalogPrices);
           // См. такую же проверку в processMarketplaceOrder: отгрузка есть, а платёж мог не
           // успеть создаться, если прошлый прогон оборвался посередине заказа.
           if (!(await paymentAlreadyExists(cId, reportDate, fullDesc))) {
@@ -2787,6 +2908,7 @@ async function processReport(reportTextRaw) {
           const demandResult = await createDemand(cId, itemsSell, reportDate, fullDesc);
           if (demandResult) {
             log(`  => Отгрузка [${header}] (${name}) успешно создана!${drSuffix()}`);
+            await fillZeroSalePrices(itemsSell, checkedCatalogPrices);
 
             const calculatedKop = itemsSell.reduce((s, it) => s + it.quantity * it.price * (1 - (it.discount || 0) / 100), 0);
             const reportKop = extractReportTotalKopecks(block);
@@ -2854,6 +2976,11 @@ async function processReport(reportTextRaw) {
     // --- СПИСАНИЕ ПОДАРКОВ ---
     if (itemsLoss.length) {
       const fullDesc = `${header}\n${block.trim()}`;
+      if (itemsLoss.some(item => item._fullyDiscounted)) {
+        existingDemand ??= await demandAlreadyExists(null, reportDate, fullDesc);
+        if (existingDemand) itemsLoss = await excludeDiscountedItemsAlreadyShipped(itemsLoss, existingDemand, header);
+        if (!itemsLoss.length) continue;
+      }
       const fullLossDesc = `🎁 Списание подарков по заказу:\n${fullDesc}`;
       const existingLoss = await lossAlreadyExists(reportDate, fullLossDesc);
       if (existingLoss) {
@@ -2986,11 +3113,283 @@ async function processReport(reportTextRaw) {
   log('Готово.');
 }
 
+/* ===================== ЦЕНЫ ИЗ NOCODB ===================== */
+
+const NOCO_PRICE_RECORDS = 'https://app.nocodb.com/api/v3/data/p1wij5aaeqtpb0f/mzyn24rg2qoo8xs/records';
+
+async function loadAvailablePrices(token) {
+  const url = new URL(NOCO_PRICE_RECORDS);
+  url.searchParams.set('view_id', 'vwtofbeikix3fup8');
+  url.searchParams.set('fields', 'Name,Price,Availability,Весовой');
+  url.searchParams.set('where', '(Availability,checked)');
+  const visited = new Set();
+  const records = [];
+  let page = url;
+  while (page) {
+    if (page.origin + page.pathname !== NOCO_PRICE_RECORDS || visited.has(page.href)) {
+      throw new Error('NocoDB вернул некорректную ссылку на следующую страницу.');
+    }
+    visited.add(page.href);
+    const response = await fetch(page.href, { headers: { 'xc-token': token }, redirect: 'error' });
+    if (!response.ok) throw new Error(`NocoDB вернул ошибку ${response.status}. Проверь доступ токена к таблице Price.`);
+    const data = await response.json();
+    if (!Array.isArray(data.records)) throw new Error('NocoDB вернул ответ без списка товаров.');
+    records.push(...data.records.filter(record => record.fields?.Availability === true));
+    page = data.next ? new URL(data.next, page) : null;
+  }
+  return records;
+}
+
+async function loadProductsForPriceUpdate() {
+  const products = [];
+  const limit = 1000;
+  for (let offset = 0; ; offset += limit) {
+    const response = await msFetch(apiUrl(`/entity/product?expand=uom&limit=${limit}&offset=${offset}`), { headers: msHeaders() });
+    if (!response.ok) throw new Error(`Не удалось прочитать карточки МойСклад (${response.status}).`);
+    const data = await response.json();
+    if (!Array.isArray(data.rows)) throw new Error('МойСклад вернул ответ без списка товаров.');
+    products.push(...data.rows.filter(product => !product.archived));
+    if (data.rows.length < limit && !data.meta?.nextHref) break;
+    if (data.rows.length !== limit) throw new Error('МойСклад вернул неполную страницу товаров.');
+  }
+  return products;
+}
+
+function parseNocoPrice(fields) {
+  const text = String(fields.Price ?? '').toLowerCase().replace(/\s+/g, '');
+  const match = text.match(/^(\d+(?:[.,]\d{1,2})?)(?:[₽рp]|руб\.?)?(?:(?:\/|за)(100г(?:р)?|кг|шт\.?|г(?:р)?))?$/i);
+  if (!match) return null;
+  const value = Math.round(Number(match[1].replace(',', '.')) * 100);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  const unit = match[2]?.replace(/\.$/, '').replace(/гр$/, 'г');
+  if (!unit && fields['Весовой'] === true) return null;
+  return { value, unit: unit || 'шт' };
+}
+
+function productPriceUnit(product) {
+  const unit = product.uom?.name?.trim().toLowerCase().replace(/\.$/, '');
+  if (['кг', 'килограмм', 'килограммы'].includes(unit)) return 'кг';
+  if (['г', 'гр', 'грамм', 'граммы'].includes(unit)) return 'г';
+  if (['шт', 'штука', 'штуки', 'упак', 'упаковка', 'комплект', 'набор'].includes(unit)) return 'шт';
+  return '';
+}
+
+function convertNocoPrice(price, unit) {
+  if (price.unit === unit) return price.value;
+  const grams = { 'г': 1, '100г': 100, 'кг': 1000 };
+  return grams[price.unit] && grams[unit] ? Math.round(price.value * grams[unit] / grams[price.unit]) : null;
+}
+
+function buildPricePreview(records, products) {
+  const rows = records.map(({ id, fields }) => {
+    const name = String(fields.Name ?? '').trim();
+    const row = { id, fields, name, reason: '' };
+    if (!name) return { ...row, reason: 'В NocoDB нет названия' };
+    const exact = products.filter(product => namesMatchExactly(name, (product.name || '').trim()));
+    if (exact.length > 1) return { ...row, reason: 'Несколько карточек с таким названием' };
+    const match = exact.length ? null : findProductMeta(name, null);
+    if (match && products.filter(product => namesMatchExactly(match.name, (product.name || '').trim())).length > 1) {
+      return { ...row, reason: 'Несколько подходящих карточек' };
+    }
+    const product = exact[0] || (match && products.find(item => item.meta?.href === match.meta?.href));
+    const path = product?.meta?.href?.match(/\/entity\/product\/[a-f0-9-]+$/i)?.[0];
+    if (!path) return { ...row, reason: 'Карточка не найдена' };
+    row.product = product;
+    row.path = path;
+    const prices = product.salePrices || [];
+    const current = prices[salePriceIndex(prices)];
+    if (!current?.priceType?.meta?.href || !Number.isSafeInteger(current.value)) {
+      return { ...row, reason: 'В карточке не определена цена продажи' };
+    }
+    row.unit = productPriceUnit(product);
+    row.oldPrice = current.value;
+    row.priceTypeHref = current.priceType.meta.href;
+    const price = parseNocoPrice(fields);
+    if (!price) return { ...row, reason: 'Проверьте формат цены или единицу в NocoDB' };
+    const value = convertNocoPrice(price, row.unit);
+    if (!Number.isSafeInteger(value) || value <= 0) return { ...row, reason: 'Нужна сверка единиц измерения' };
+    row.newPrice = value;
+    row.review = Boolean(match && !match.viaManualMap);
+    return row;
+  });
+
+  const counts = new Map();
+  for (const row of rows) {
+    if (row.path) counts.set(row.path, (counts.get(row.path) || 0) + 1);
+  }
+  for (const row of rows) {
+    if (counts.get(row.path) > 1) row.reason = 'Несколько строк NocoDB сопоставились с одной карточкой';
+    if (!row.reason && row.oldPrice === row.newPrice) row.reason = 'Цена совпадает';
+  }
+  return rows;
+}
+
+async function writePreviewedPrice(row) {
+  const url = apiUrl(row.path);
+  const response = await msFetch(`${url}?expand=uom`, { headers: msHeaders() });
+  if (!response.ok) throw new Error(`ошибка чтения ${response.status}`);
+  const product = await response.json();
+  const prices = product.salePrices || [];
+  const index = salePriceIndex(prices);
+  if (product.archived || product.name !== row.product.name || productPriceUnit(product) !== row.unit ||
+      prices[index]?.priceType?.meta?.href !== row.priceTypeHref || prices[index].value !== row.oldPrice) {
+    return 'Карточка изменилась. Обновите предпросмотр.';
+  }
+  prices[index] = { ...prices[index], value: row.newPrice };
+  const updated = await msFetch(url, { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ salePrices: prices }) });
+  if (!updated.ok) throw new Error(`ошибка записи ${updated.status}`);
+  return '';
+}
+
 /* ===================== UI ===================== */
 
 const statusEl = document.getElementById('status');
 const processBtn = document.getElementById('processBtn');
 const settingsStatusEl = document.getElementById('settingsStatus');
+const updatePricesBtn = document.getElementById('updatePricesBtn');
+const priceDialog = document.getElementById('priceDialog');
+const nocoPriceToken = document.getElementById('nocoPriceToken');
+const previewPricesBtn = document.getElementById('previewPricesBtn');
+const applyPricesBtn = document.getElementById('applyPricesBtn');
+const closePricesBtn = document.getElementById('closePricesBtn');
+const priceStatus = document.getElementById('priceStatus');
+const priceRows = document.getElementById('priceRows');
+const priceRowsWrap = document.getElementById('priceRowsWrap');
+const priceFormat = new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB' });
+let pricePreview = [];
+let priceBusy = false;
+
+function refreshPriceControls() {
+  previewPricesBtn.disabled = priceBusy;
+  closePricesBtn.disabled = priceBusy;
+  nocoPriceToken.disabled = priceBusy;
+  applyPricesBtn.disabled = priceBusy || !pricePreview.some(row => row.selected);
+  for (const row of pricePreview) {
+    if (row.checkbox) row.checkbox.disabled = priceBusy;
+  }
+}
+
+function renderPricePreview() {
+  const fragment = document.createDocumentFragment();
+  for (const row of pricePreview) {
+    const tr = document.createElement('tr');
+    const price = Number.isSafeInteger(row.newPrice)
+      ? `${priceFormat.format(row.oldPrice / 100)} → ${priceFormat.format(row.newPrice / 100)} / ${row.unit}`
+      : '—';
+    const values = ['', `${row.name || 'Без названия'} · ${row.fields.Price ?? '—'}`, row.product?.name || '—', price,
+      row.reason || (row.review ? 'Проверьте совпадение названий' : 'Готово к обновлению')];
+    for (const value of values) {
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      tr.append(cell);
+    }
+    if (!row.reason) {
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = row.selected;
+      checkbox.setAttribute('aria-label', `Применить цену для ${row.name}`);
+      checkbox.addEventListener('change', () => {
+        row.selected = checkbox.checked;
+        applyPricesBtn.disabled = !pricePreview.some(item => item.selected);
+      });
+      row.checkbox = checkbox;
+      tr.firstElementChild.append(checkbox);
+    }
+    fragment.append(tr);
+  }
+  priceRows.replaceChildren(fragment);
+  priceRowsWrap.hidden = !pricePreview.length;
+  refreshPriceControls();
+}
+
+updatePricesBtn.addEventListener('click', () => {
+  loadConfig();
+  if (!CONFIG.workerUrl || !CONFIG.token) {
+    settingsStatusEl.textContent = 'Укажите адрес прокси и токен МойСклад.';
+    document.getElementById('settingsBlock').open = true;
+    return;
+  }
+  priceDialog.showModal();
+});
+
+closePricesBtn.addEventListener('click', () => priceDialog.close());
+priceDialog.addEventListener('cancel', event => {
+  if (priceBusy) event.preventDefault();
+});
+priceDialog.addEventListener('close', () => {
+  nocoPriceToken.value = '';
+  pricePreview = [];
+  priceStatus.textContent = '';
+  renderPricePreview();
+});
+nocoPriceToken.addEventListener('input', () => {
+  pricePreview = [];
+  priceStatus.textContent = '';
+  renderPricePreview();
+});
+
+previewPricesBtn.addEventListener('click', async () => {
+  const token = nocoPriceToken.value.trim();
+  if (!token) {
+    priceStatus.textContent = 'Введите токен NocoDB для чтения таблицы Price.';
+    nocoPriceToken.focus();
+    return;
+  }
+  priceBusy = true;
+  pricePreview = [];
+  renderPricePreview();
+  priceStatus.textContent = 'Загружаю каталог и сверяю цены…';
+  try {
+    const [records, products] = await Promise.all([loadAvailablePrices(token), loadProductsForPriceUpdate()]);
+    indexProducts(products);
+    pricePreview = buildPricePreview(records, products);
+    for (const row of pricePreview) row.selected = !row.reason && !row.review;
+    const changed = pricePreview.filter(row => !row.reason).length;
+    priceStatus.textContent = `Позиций с Availability: ${records.length}. Можно обновить цены: ${changed}.`;
+  } catch (error) {
+    priceStatus.textContent = `Предпросмотр недоступен. ${error.message}`;
+  } finally {
+    priceBusy = false;
+    renderPricePreview();
+  }
+});
+
+applyPricesBtn.addEventListener('click', async () => {
+  const selected = pricePreview.filter(row => row.selected);
+  if (priceBusy || !selected.length) return;
+  priceBusy = true;
+  refreshPriceControls();
+  priceStatus.textContent = 'Повторно проверяю Availability и цены в NocoDB…';
+  let applied = 0;
+  try {
+    const fresh = await loadAvailablePrices(nocoPriceToken.value.trim());
+    const byId = new Map(fresh.map(record => [record.id, record.fields]));
+    for (const row of selected) {
+      const fields = byId.get(row.id);
+      if (!fields || fields.Name !== row.fields.Name || fields.Price !== row.fields.Price ||
+          fields['Весовой'] !== row.fields['Весовой']) {
+        row.reason = 'Источник изменился. Обновите предпросмотр.';
+      } else {
+        try {
+          row.reason = await writePreviewedPrice(row);
+          if (!row.reason) {
+            row.reason = 'Обновлено';
+            applied++;
+          }
+        } catch (error) {
+          row.reason = `Не удалось обновить: ${error.message}`;
+        }
+      }
+      row.selected = false;
+    }
+    priceStatus.textContent = `Обновлено: ${applied} из ${selected.length}. Результат по каждому товару — в таблице.`;
+  } catch (error) {
+    priceStatus.textContent = `Проверка NocoDB не завершилась. ${error.message}`;
+  } finally {
+    priceBusy = false;
+    renderPricePreview();
+  }
+});
 
 document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   saveConfig();
@@ -3049,6 +3448,7 @@ processBtn.addEventListener('click', async () => {
 
   clearLog();
   processBtn.disabled = true;
+  updatePricesBtn.disabled = true;
   processBtn.textContent = DRY_RUN ? 'Проверяю (тест)...' : 'Обрабатываю...';
   statusEl.textContent = '';
 
@@ -3073,6 +3473,7 @@ processBtn.addEventListener('click', async () => {
   } finally {
     DRY_RUN = false;
     processBtn.disabled = false;
+    updatePricesBtn.disabled = false;
     processBtn.textContent = 'Провести ▶';
   }
 });
