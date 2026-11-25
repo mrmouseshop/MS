@@ -3240,6 +3240,8 @@ function buildPricePreview(records, products) {
     if (!productId || !/^[a-f0-9-]+$/i.test(productId)) return { ...row, reason: 'Карточка найдена, но нет ID для обновления цены' };
     const path = '/entity/product/' + productId;
     row.path = path;
+    row.viaShippingRule = Boolean(match?.viaManualMap);
+    row.review = Boolean(match && !row.viaShippingRule);
     row.unit = productPriceUnit(product);
     const prices = product.salePrices || [];
     const current = prices[salePriceIndex(prices)];
@@ -3255,16 +3257,36 @@ function buildPricePreview(records, products) {
     if (value === null) return { ...row, reason: 'Единицы различаются, пересчёт невозможен' };
     if (!Number.isSafeInteger(value) || value <= 0) return { ...row, reason: 'Цена после пересчёта вне допустимого диапазона' };
     row.newPrice = value;
-    row.review = Boolean(match && !match.viaManualMap);
     return row;
   });
 
-  const counts = new Map();
+  const groups = new Map();
   for (const row of rows) {
-    if (row.path) counts.set(row.path, (counts.get(row.path) || 0) + 1);
+    if (!row.path) continue;
+    if (!groups.has(row.path)) groups.set(row.path, []);
+    groups.get(row.path).push(row);
+  }
+  for (const group of groups.values()) {
+    if (group.length === 1) continue;
+    const confirmed = group.filter(row => !row.review);
+    const sharedByRule = confirmed.some(row => row.viaShippingRule);
+    for (const row of group) {
+      if (!sharedByRule || row.review) {
+        row.reason ||= 'Несколько строк NocoDB сопоставились с одной карточкой без общего правила отгрузки';
+      }
+    }
+    if (!sharedByRule) continue;
+    const valid = confirmed.filter(row => !row.reason);
+    const differentPrices = new Set(valid.map(row => row.newPrice)).size > 1;
+    for (const [index, row] of valid.entries()) {
+      row.sharedCardNote = differentPrices
+        ? 'Общая карточка по правилу отгрузки. Выберите одну цену.'
+        : 'Общая карточка по правилу отгрузки. Цена записывается один раз.';
+      row.selectManually = differentPrices || index > 0;
+      if (!differentPrices && valid.length > 1) row.agreedPrices = valid;
+    }
   }
   for (const row of rows) {
-    if (counts.get(row.path) > 1) row.reason = 'Несколько строк NocoDB сопоставились с одной карточкой';
     if (!row.reason && row.oldPrice === row.newPrice) row.reason = 'Цена совпадает';
   }
   return rows;
@@ -3286,6 +3308,11 @@ async function writePreviewedPrice(row) {
   const updated = await msFetch(url, { method: 'PUT', headers: msHeaders(), body: JSON.stringify({ salePrices: prices }) });
   if (!updated.ok) throw new Error(`ошибка записи ${updated.status}`);
   return '';
+}
+
+function priceSourceUnchanged(row, fields) {
+  return fields && fields.Name === row.fields.Name && fields.Price === row.fields.Price &&
+    fields['Весовой'] === row.fields['Весовой'];
 }
 
 /* ===================== UI ===================== */
@@ -3327,7 +3354,7 @@ function renderPricePreview() {
     const targetUnit = row.product?.uom?.name || '—';
     const values = ['', `${row.name || 'Без названия'} · ${row.fields.Price ?? '—'}`, row.product?.name || '—',
       `${sourceUnit} → ${targetUnit}`, price,
-      row.reason || (row.review ? 'Проверьте совпадение названий' : 'Готово к обновлению')];
+      row.reason || row.sharedCardNote || (row.review ? 'Проверьте совпадение названий' : 'Готово к обновлению')];
     for (const value of values) {
       const cell = document.createElement('td');
       cell.textContent = value;
@@ -3340,6 +3367,14 @@ function renderPricePreview() {
       checkbox.setAttribute('aria-label', `Применить цену для ${row.name}`);
       checkbox.addEventListener('change', () => {
         row.selected = checkbox.checked;
+        if (row.selected && row.sharedCardNote) {
+          for (const other of pricePreview) {
+            if (other !== row && other.path === row.path && other.selected) {
+              other.selected = false;
+              other.checkbox.checked = false;
+            }
+          }
+        }
         applyPricesBtn.disabled = !pricePreview.some(item => item.selected);
       });
       row.checkbox = checkbox;
@@ -3392,9 +3427,9 @@ previewPricesBtn.addEventListener('click', async () => {
   try {
     const [records, products] = await Promise.all([loadAvailablePrices(token), loadProductsForPriceUpdate()]);
     pricePreview = buildPricePreview(records, products);
-    for (const row of pricePreview) row.selected = !row.reason && !row.review;
-    const changed = pricePreview.filter(row => !row.reason).length;
-    priceStatus.textContent = `Позиций с Availability: ${records.length}. Можно обновить цены: ${changed}.`;
+    for (const row of pricePreview) row.selected = !row.reason && !row.review && !row.selectManually;
+    const changed = new Set(pricePreview.filter(row => !row.reason).map(row => row.path)).size;
+    priceStatus.textContent = `Позиций с Availability: ${records.length}. Карточек для обновления: ${changed}.`;
   } catch (error) {
     priceStatus.textContent = `Предпросмотр недоступен. ${error.message}`;
   } finally {
@@ -3414,9 +3449,8 @@ applyPricesBtn.addEventListener('click', async () => {
     const fresh = await loadAvailablePrices(nocoPriceToken.value.trim());
     const byId = new Map(fresh.map(record => [record.id, record.fields]));
     for (const row of selected) {
-      const fields = byId.get(row.id);
-      if (!fields || fields.Name !== row.fields.Name || fields.Price !== row.fields.Price ||
-          fields['Весовой'] !== row.fields['Весовой']) {
+      if (!priceSourceUnchanged(row, byId.get(row.id)) ||
+          row.agreedPrices?.some(other => !priceSourceUnchanged(other, byId.get(other.id)))) {
         row.reason = 'Источник изменился. Обновите предпросмотр.';
       } else {
         try {
@@ -3424,6 +3458,11 @@ applyPricesBtn.addEventListener('click', async () => {
           if (!row.reason) {
             row.reason = 'Обновлено';
             applied++;
+            for (const other of pricePreview) {
+              if (other !== row && other.path === row.path && !other.reason) {
+                other.reason = 'Цена общей карточки уже обновлена';
+              }
+            }
           }
         } catch (error) {
           row.reason = `Не удалось обновить: ${error.message}`;
