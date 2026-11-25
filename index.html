@@ -739,7 +739,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '25.11.2026-4 (сверка цен с NocoDB)';
+const APP_VERSION = '25.11.2026-5 (поиск карточек для сверки цен)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -971,7 +971,7 @@ function namesMatchExactly(reportText, catalogName) {
   return norm(reportText) === norm(catalogName);
 }
 
-function findProductMeta(pRaw, weight) {
+function findProductMeta(pRaw, weight, catalog = PRODUCTS_CACHE) {
   let query = pRaw.toLowerCase().trim();
 
   // Пометку "[SALE]" убираем ещё ДО разбиения на слова для поиска — иначе она сама
@@ -1018,8 +1018,8 @@ function findProductMeta(pRaw, weight) {
       // в названии карточки и поиск уходил в нечёткий режим.
       const mapNorm = s => s.trim().toLowerCase().replace(/ä/g, 'a').replace(/[’‘`]/g, "'").replace(/\s+/g, ' ');
       const correctNameClean = mapNorm(correctName);
-      for (const fullName in PRODUCTS_CACHE) {
-        const data = PRODUCTS_CACHE[fullName];
+      for (const fullName in catalog) {
+        const data = catalog[fullName];
         const msNameClean = mapNorm(fullName);
         if (msNameClean === correctNameClean) {
           // viaManualMap: это заранее вручную проверенное человеком соответствие (а не догадка
@@ -1054,8 +1054,8 @@ function findProductMeta(pRaw, weight) {
   let best = null;
   let bestPrecision = -1;
 
-  for (const fullName in PRODUCTS_CACHE) {
-    const data = PRODUCTS_CACHE[fullName];
+  for (const fullName in catalog) {
+    const data = catalog[fullName];
     const nameLower = joinSizeUnits(fullName.toLowerCase());
     const nameLowerFolded = foldHomoglyphs(nameLower);
     const matches = queryWordsFolded.filter(w => nameLowerFolded.includes(w)).length;
@@ -3208,22 +3208,37 @@ function convertNocoPrice(price, unit) {
   return grams[price.unit] && grams[unit] ? Math.round(price.value * grams[unit] / grams[price.unit]) : null;
 }
 
+function normalizePriceProductName(name) {
+  return name.normalize('NFKC')
+    .replace(/ё/gi, 'е')
+    .replace(/(\d),(?=\d)/g, '$1.')
+    .replace(/(\d)\s*гр?(?![а-яёa-z])/gi, '$1гр')
+    .replace(/[’‘`]/g, "'")
+    .replace(/[‐‑–—]/g, '-');
+}
+
 function buildPricePreview(records, products) {
+  const catalog = Object.fromEntries(products.map(product => [String(product.name || '').trim(), product]));
   const rows = records.map(({ id, fields }) => {
     const name = String(fields.Name ?? '').trim();
     const price = parseNocoPrice(fields);
     const row = { id, fields, name, sourceUnit: price?.unit, reason: '' };
     if (!name) return { ...row, reason: 'В NocoDB нет названия' };
-    const exact = products.filter(product => namesMatchExactly(name, (product.name || '').trim()));
-    if (exact.length > 1) return { ...row, reason: 'Несколько карточек с таким названием' };
-    const match = exact.length ? null : findProductMeta(name, null);
-    if (match && products.filter(product => namesMatchExactly(match.name, (product.name || '').trim())).length > 1) {
-      return { ...row, reason: 'Несколько подходящих карточек' };
+    const productName = name.replace(/\s+[-–—]\s*\d+(?:[.,]\d+)?\s*(?:₽|руб\.?|р\.?)\s*$/i, '').trim();
+    const exactName = normalizePriceProductName(productName);
+    let matches = products.filter(product => namesMatchExactly(exactName, normalizePriceProductName(product.name || '')));
+    const match = matches.length ? null : findProductMeta(productName, null, catalog);
+    if (match) {
+      const matchedName = normalizePriceProductName(match.name);
+      matches = products.filter(product => namesMatchExactly(matchedName, normalizePriceProductName(product.name || '')));
     }
-    const product = exact[0] || (match && products.find(item => item.meta?.href === match.meta?.href));
-    const path = product?.meta?.href?.match(/\/entity\/product\/[a-f0-9-]+$/i)?.[0];
-    if (!path) return { ...row, reason: 'Карточка не найдена' };
+    if (matches.length > 1) return { ...row, reason: 'Несколько подходящих карточек МойСклад' };
+    const product = matches[0];
+    if (!product) return { ...row, reason: 'Нет совпадения по названию в каталоге МойСклад' };
     row.product = product;
+    const productId = product.id || product.meta?.href?.match(/\/entity\/product\/([a-f0-9-]+)\/?(?:[?#].*)?$/i)?.[1];
+    if (!productId || !/^[a-f0-9-]+$/i.test(productId)) return { ...row, reason: 'Карточка найдена, но нет ID для обновления цены' };
+    const path = '/entity/product/' + productId;
     row.path = path;
     row.unit = productPriceUnit(product);
     const prices = product.salePrices || [];
@@ -3376,7 +3391,6 @@ previewPricesBtn.addEventListener('click', async () => {
   priceStatus.textContent = 'Загружаю каталог и сверяю цены…';
   try {
     const [records, products] = await Promise.all([loadAvailablePrices(token), loadProductsForPriceUpdate()]);
-    indexProducts(products);
     pricePreview = buildPricePreview(records, products);
     for (const row of pricePreview) row.selected = !row.reason && !row.review;
     const changed = pricePreview.filter(row => !row.reason).length;
