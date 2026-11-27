@@ -753,7 +753,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '27.11.2026-3 (артикулы и вес ОЗОН)';
+const APP_VERSION = '27.11.2026-4 (единицы измерения ОЗОН)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -768,13 +768,7 @@ function salePriceIndex(prices) {
 async function loadProducts() {
   log(`Версия программы: ${APP_VERSION}`);
   log('Загружаю базу товаров из МоегоСклада...');
-  const resp = await msFetch(apiUrl('/entity/product?expand=uom&limit=1000'), { headers: msHeaders() });
-  if (!resp.ok) {
-    log(`  [ОШИБКА API] Не удалось загрузить товары (код ${resp.status}): ${await resp.text()}`);
-    throw new Error('load_products failed');
-  }
-  const data = await resp.json();
-  indexProducts(data.rows || []);
+  indexProducts(await loadMoySkladProducts());
 }
 
 function indexProducts(products) {
@@ -793,7 +787,11 @@ function indexProducts(products) {
       // артикул под каждую карточку на маркетплейсе ("THERAMEDNatur Weib3, Theramed3in1").
       // Регистрируем каждый код по отдельности, чтобы заказ с ЛЮБЫМ из них находил товар.
       const articleCodes = article.split(/[,;/]+/).map(s => s.trim()).filter(Boolean);
-      const productData = { meta: item.meta, price, buy_price: buyPrice, name: fullName, unit: productPriceUnit(item) };
+      const productData = {
+        meta: item.meta, price, buy_price: buyPrice, name: fullName,
+        unit: productPriceUnit(item),
+        unitUnresolved: Boolean(item.uom?.meta?.href && !item.uom.name),
+      };
       for (const code of articleCodes) {
         ARTICLE_CACHE[code.toLowerCase()] = productData;
       }
@@ -2175,7 +2173,8 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
   const registerCancelled = (demandId) => {
     const items = ozonLines.map(({ qty, article }) => {
       const { productData, qtyMultiplier } = resolveOzonArticle(article);
-      return { qty, article, name: productData?.name || '', pieces: qtyMultiplier > 1 ? qty * qtyMultiplier : null };
+      const pieces = qtyMultiplier > 1 && productData?.unit !== 'кг' ? qty * qtyMultiplier : null;
+      return { qty, article, name: productData?.name || '', pieces };
     });
     if (!stats.cancelledOzon) stats.cancelledOzon = [];
     stats.cancelledOzon.push({ header, posting: cpRaw, items });
@@ -2247,6 +2246,10 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
       continue;
     }
     const requiresWeight = productData.unit === 'кг';
+    if (!isPendingStatus && noWeightField && productData.unitUnresolved) {
+      blockers.push(`у '${article}' не удалось определить единицу измерения и вес не передан`);
+      continue;
+    }
     if (weightMissing || (requiresWeight && noWeightField)) {
       if (!isPendingStatus) {
         // Заказ уже собран/доставляется, а вес так и не вписан — сколько списывать, неизвестно.
@@ -2266,11 +2269,12 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
     if (baseArticle) {
       log(`  [OZON] Для набора '${article}' найдена поштучная карточка по артикулу '${baseArticle}'.`);
     }
-    if (multiplierSuffix && qtyMultiplier > 1) {
+    const shipmentMultiplier = requiresWeight ? 1 : qtyMultiplier;
+    if (multiplierSuffix && shipmentMultiplier > 1) {
       log(`  [OZON] Для артикула '${article}' множитель x${qtyMultiplier} взят из окончания "${multiplierSuffix}".`);
     }
-    const shipQty = qty * qtyMultiplier;
-    if (qtyMultiplier !== 1) {
+    const shipQty = qty * shipmentMultiplier;
+    if (shipmentMultiplier !== 1) {
       log(`  [OZON] Артикул '${article}' — это набор x${qtyMultiplier}: в отгрузку идёт ${shipQty} шт (${qty} шт заказа ОЗОН × ${qtyMultiplier}).`);
     }
     log(`  [OZON] Артикул '${article}' найден как '${productData.name}' (Кол-во: ${shipQty})`);
@@ -3183,7 +3187,7 @@ async function loadAvailablePrices(token, onProgress) {
   return records;
 }
 
-async function loadProductsForPriceUpdate(onProgress) {
+async function loadMoySkladProducts(onProgress) {
   const products = [];
   const limit = 100;
   for (let offset = 0; ; offset += limit) {
@@ -3536,7 +3540,7 @@ previewPricesBtn.addEventListener('click', async () => {
   try {
     const [source, catalog] = await Promise.allSettled([
       loadAvailablePrices(token, count => logPriceUpdate(`NocoDB · загружено доступных позиций: ${count}.`)),
-      loadProductsForPriceUpdate(logPriceUpdate),
+      loadMoySkladProducts(logPriceUpdate),
     ]);
     if (source.status === 'rejected') throw source.reason;
     if (catalog.status === 'rejected') throw catalog.reason;
