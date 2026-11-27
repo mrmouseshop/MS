@@ -753,7 +753,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '26.11.2026-3 (соответствие Basiron Baby)';
+const APP_VERSION = '27.11.2026-3 (артикулы и вес ОЗОН)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -768,7 +768,7 @@ function salePriceIndex(prices) {
 async function loadProducts() {
   log(`Версия программы: ${APP_VERSION}`);
   log('Загружаю базу товаров из МоегоСклада...');
-  const resp = await msFetch(apiUrl('/entity/product?limit=1000'), { headers: msHeaders() });
+  const resp = await msFetch(apiUrl('/entity/product?expand=uom&limit=1000'), { headers: msHeaders() });
   if (!resp.ok) {
     log(`  [ОШИБКА API] Не удалось загрузить товары (код ${resp.status}): ${await resp.text()}`);
     throw new Error('load_products failed');
@@ -793,8 +793,9 @@ function indexProducts(products) {
       // артикул под каждую карточку на маркетплейсе ("THERAMEDNatur Weib3, Theramed3in1").
       // Регистрируем каждый код по отдельности, чтобы заказ с ЛЮБЫМ из них находил товар.
       const articleCodes = article.split(/[,;/]+/).map(s => s.trim()).filter(Boolean);
+      const productData = { meta: item.meta, price, buy_price: buyPrice, name: fullName, unit: productPriceUnit(item) };
       for (const code of articleCodes) {
-        ARTICLE_CACHE[code.toLowerCase()] = { meta: item.meta, price: price, buy_price: buyPrice, name: fullName };
+        ARTICLE_CACHE[code.toLowerCase()] = productData;
       }
     }
   }
@@ -1267,11 +1268,9 @@ function detectFlatDiscountRub(blockText) {
     // делала: из списка позиций она отсекалась (слово "купон" в стоп-списке), а как скидка
     // не распознавалась — Итого в отчёте уже было уменьшено на 100₽, а сумма позиций в
     // отгрузке и платёж — нет (переплата в МоемСкладе на сумму купона + ложная
-    // "НЕСОСТЫКОВКА" почти на всю сумму купона). Требуем явную рублёвую единицу после числа,
-    // чтобы не спутать с процентным купоном ("Купон 10%" — см. detectDiscountPercent).
-    // (\b тут не годится — в JS он "видит" только латиницу, поэтому границы кириллических
-    // слов проверяем явным lookahead.)
-    const c = line.match(/^купон[а-яё]*(?![а-яё])[^\d%]{0,20}?(\d+(?:[.,]\d+)?)\s*(?:р(?![а-яё])\.?|руб[а-яё]*\.?|₽)(?!\s*\/)/i);
+    // "НЕСОСТЫКОВКА" почти на всю сумму купона). Без обозначения рублей принимаем
+    // только форму "Купон 189 с прошлого заказа", где число — сумма перенесённого купона.
+    const c = line.match(/^купон[а-яё]*(?![а-яё])[^\d%]{0,20}?(\d+(?:[.,]\d+)?)\s*(?:(?:р(?![а-яё])\.?|руб[а-яё]*\.?|₽)(?!\s*\/)|(?=с\s+прошлого\s+заказа[.!]?\s*$))/i);
     if (c) {
       totalRub += parseFloat(c[1].replace(',', '.'));
       found = true;
@@ -2053,6 +2052,32 @@ const OZON_ARTICLE_QTY_MULTIPLIER = {
   'cv_pecorino_romano_quattrocolli_200g_x2': 2,
 };
 
+function resolveOzonArticle(article) {
+  const exactProduct = findProductByArticle(article);
+  const tableMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()];
+  const legacySuffix = article.match(/_x(\d{1,2})$/i);
+  const packSuffix = article.match(/^(.+)(-x(\d{1,2}))$/i);
+  if (packSuffix && Number(packSuffix[3]) > 1) {
+    const [, baseArticle, suffix, packSize] = packSuffix;
+    const baseProduct = findProductByArticle(baseArticle);
+    // Два артикула одной поштучной карточки должны списывать столько же, сколько поиск по базовому.
+    if (baseProduct && (!exactProduct || exactProduct === baseProduct)) {
+      return {
+        productData: baseProduct,
+        qtyMultiplier: tableMultiplier || Number(packSize),
+        multiplierSuffix: tableMultiplier ? null : suffix,
+        baseArticle: exactProduct ? undefined : baseArticle,
+      };
+    }
+  }
+
+  return {
+    productData: exactProduct,
+    qtyMultiplier: tableMultiplier || (legacySuffix ? Number(legacySuffix[1]) : 1),
+    multiplierSuffix: tableMultiplier ? null : legacySuffix?.[0],
+  };
+}
+
 function extractOzonReportAmount(lines) {
   const amounts = [];
   for (const line of lines) {
@@ -2129,6 +2154,10 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
         noWeightField = false;
         weightMissing = false;
       }
+      if (weight !== null && weight <= 0) {
+        weight = null;
+        weightMissing = true;
+      }
       ozonLines.push({ qty: weight !== null ? weight : qty, article, weightMissing, noWeightField, note });
     }
   }
@@ -2145,11 +2174,8 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
   // Отменённый заказ — в сводку и в карточку "❌ Отменённые ОЗОН — проверить" (см. выше).
   const registerCancelled = (demandId) => {
     const items = ozonLines.map(({ qty, article }) => {
-      const pd = findProductByArticle(article);
-      // Для наборов "_xN" показываем и реальное число штук ("2 × …_x4 (= 8 шт)").
-      const sm = article.match(/_x(\d{1,2})$/i);
-      const mult = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()] || (sm ? parseInt(sm[1], 10) : 1);
-      return { qty, article, name: pd ? pd.name : '', pieces: mult > 1 ? qty * mult : null };
+      const { productData, qtyMultiplier } = resolveOzonArticle(article);
+      return { qty, article, name: productData?.name || '', pieces: qtyMultiplier > 1 ? qty * qtyMultiplier : null };
     });
     if (!stats.cancelledOzon) stats.cancelledOzon = [];
     stats.cancelledOzon.push({ header, posting: cpRaw, items });
@@ -2188,7 +2214,7 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
   if (!stats.notFound) stats.notFound = [];
   if (!stats.ozonNotes) stats.ozonNotes = [];
   for (const { qty, article, weightMissing, noWeightField, note } of ozonLines) {
-    const productData = findProductByArticle(article);
+    const { productData, qtyMultiplier, multiplierSuffix, baseArticle } = resolveOzonArticle(article);
     if (!productData) {
       log(`  [!!!] ВНИМАНИЕ: ОЗОН-товар с артикулом '${article}' не найден в МоемСкладе! Заказ [${header}] — проведите вручную.`);
       stats.notFound.push({ header, what: `артикул '${article}'` });
@@ -2220,30 +2246,28 @@ async function processMarketplaceOrder(header, block, lines, reportDate, stats) 
       newItems.push({ quantity: replacement.qty, assortment: { meta: replacement.product.meta }, price: replacement.product.price, _name: replacement.product.name });
       continue;
     }
-    if (weightMissing) {
+    const requiresWeight = productData.unit === 'кг';
+    if (weightMissing || (requiresWeight && noWeightField)) {
       if (!isPendingStatus) {
         // Заказ уже собран/доставляется, а вес так и не вписан — сколько списывать, неизвестно.
         log(`  [!!!] ВНИМАНИЕ: в заказе ОЗОН [${header}] у '${article}' не указан вес куска — заказ не создаю, проведите вручную.`);
         blockers.push(`у '${article}' не указан вес`);
         continue;
       }
-      if (looksWeighed(productData.name)) {
+      if (requiresWeight || looksWeighed(productData.name)) {
         log(`  [ПРЕДУПРЕЖДЕНИЕ] В заказе ОЗОН [${header}] у '${article}' ещё не указан вес (заказ не собран) — в черновик отгрузки поставлено ${qty} шт, поправьте количество, когда кусок взвесят.`);
       }
     }
-    // Если артикула нет в таблице, но он оканчивается на "_xN" (так названы все наборы —
-    // "CV_..._x2", "_x3", "_x4"), берём N из самого артикула. Реальный случай 07.11:
-    // "CV_Jamon_NICO_Serrano_250g_x2" не было в таблице, и в отгрузку ушла 1 шт вместо 2.
-    const tableMultiplier = OZON_ARTICLE_QTY_MULTIPLIER[article.toLowerCase()];
-    const suffixMatch = article.match(/_x(\d{1,2})$/i);
-    const qtyMultiplier = tableMultiplier || (suffixMatch ? parseInt(suffixMatch[1], 10) : 1);
-    if (isPendingStatus && noWeightField && qtyMultiplier === 1 && looksWeighed(productData.name)) {
+    if (isPendingStatus && noWeightField && !requiresWeight && qtyMultiplier === 1 && looksWeighed(productData.name)) {
       // Несобранный заказ: вес куска ещё не вписан (поля веса нет вовсе). Для штучного товара
       // это нормально, для весового — в черновик уйдёт "1" (кг), и его надо поправить при сборке.
       log(`  [ПРЕДУПРЕЖДЕНИЕ] Заказ ОЗОН [${header}] ещё не собран, вес у '${article}' не указан — в черновике ${qty}; если товар весовой, поправьте количество, когда кусок взвесят.`);
     }
-    if (!tableMultiplier && suffixMatch && qtyMultiplier > 1) {
-      log(`  [OZON] Артикула '${article}' нет в таблице наборов — множитель x${qtyMultiplier} взят из окончания артикула "_x${qtyMultiplier}".`);
+    if (baseArticle) {
+      log(`  [OZON] Для набора '${article}' найдена поштучная карточка по артикулу '${baseArticle}'.`);
+    }
+    if (multiplierSuffix && qtyMultiplier > 1) {
+      log(`  [OZON] Для артикула '${article}' множитель x${qtyMultiplier} взят из окончания "${multiplierSuffix}".`);
     }
     const shipQty = qty * qtyMultiplier;
     if (qtyMultiplier !== 1) {
