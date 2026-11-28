@@ -753,7 +753,7 @@ function pyRound(x, ndigits) {
 
 // Версия программы — печатается в начале каждого прогона, чтобы по журналу было видно,
 // какая версия файла реально работала (если вкладка не обновлена или файл откатился).
-const APP_VERSION = '27.11.2026-6 (соответствие Бебибел 10шт)';
+const APP_VERSION = '28.11.2026-1 (уточнение названий пармезана)';
 
 let PRODUCTS_CACHE = {};
 let ARTICLE_CACHE = {}; // товары по артикулу (для маркетплейс-заказов вроде ОЗОН, где ищем не по названию)
@@ -851,6 +851,7 @@ const MANUAL_MAP = {
   'камамбер кaserei': 'Камамбер Käserei 125гр',
   'ландана блю с какао': 'Ландана блю с какао (коровий)',
   'пармезан 60mesi cantarelli': 'Пармезан 60mesi Cantarelli (limited edition) ~300гр',
+  'пармезан 48mesi cantarelli opera unica ~250гр': 'Пармезан 48mesi Cantarelli Opera Unica',
   'геитост tine (ekte geitost) 250гр': 'Геитост TINE (EKTE Geitost) 250гр',
   'чеддер snоwdоniа веесhwооd': 'Чеддер SNОWDОNIА Веесhwооd 200гр',
   'occelli бароло в виноградном жмыхе (весовой)': 'Occelli Бароло в виноградном жмыхе (весовой)',
@@ -981,7 +982,7 @@ function namesMatchExactly(reportText, catalogName) {
   // бы действительно новые и непроверенные подстановки (как Пармезан ~270гр/~1кг).
   const norm = s => foldHomoglyphs(joinSizeUnits(s.toLowerCase()))
     .replace(/\[\s*sale\s*\]/gi, '')
-    .replace(/[«»"'„“”]/g, '')
+    .replace(/[«»"'‘’`„“”]/g, '')
     .replace(/[-–—.,]+\s*$/g, '')
     // "~" (приблизительный вес куска) — тоже косметика: "Gran Duca 30 мес ~300гр" в отчёте и
     // "Gran Duca 30 мес 300гр" в каталоге — один и тот же товар (реальный случай 08.11).
